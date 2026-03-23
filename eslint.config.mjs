@@ -10,6 +10,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Python virtualenv and generated/transient assets:
+    "transcriber/.venv/**",
+    "transcriber/media/**",
   ]),
 ]);
 

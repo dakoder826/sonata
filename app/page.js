@@ -2,12 +2,14 @@
 
 import { useState } from "react";
 import AuthButtons from "@/components/AuthButtons";
+import MidiPlayer from "@/components/MidiPlayer";
 
 export default function Home() {
   const [songUrl, setSongUrl] = useState("");
   const [status, setStatus] = useState("idle"); // idle | pending | done | error
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
+  const [cleanLevel, setCleanLevel] = useState("balanced"); // simple | balanced | detailed (easy | medium | hard)
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -26,7 +28,7 @@ export default function Home() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ songUrl }),
+        body: JSON.stringify({ songUrl, cleanLevel }),
       });
 
       if (!response.ok) {
@@ -53,9 +55,7 @@ export default function Home() {
               ♫
             </div>
             <div>
-              <p className="text-sm font-semibold text-zinc-900">
-                Piano Sheet Converter
-              </p>
+              <p className="text-sm font-semibold text-zinc-900">Sonata</p>
               <p className="text-xs text-zinc-500">
                 Paste a link. Get a piano sheet.
               </p>
@@ -68,14 +68,14 @@ export default function Home() {
       <main className="flex-1">
         <div className="mx-auto flex max-w-4xl flex-col gap-8 px-4 py-12 md:py-16">
           <section className="max-w-2xl">
-            <h1 className="text-3xl font-semibold tracking-tight text-zinc-900 md:text-4xl">
+            <h1 className="text-3xl font-semibold tracking-tight text-white md:text-4xl">
               Convert any song link into{" "}
               <span className="underline decoration-zinc-400">
                 clean piano sheets
               </span>
               .
             </h1>
-            <p className="mt-3 text-sm text-zinc-600 md:text-base">
+            <p className="mt-3 text-sm text-white md:text-base">
               No account needed to try it out. Sign in only if you want to save
               your pieces and come back later.
             </p>
@@ -96,11 +96,34 @@ export default function Home() {
                   placeholder="Paste a YouTube link, audio URL, etc."
                   value={songUrl}
                   onChange={(event) => setSongUrl(event.target.value)}
-                  className="w-full rounded-xl border border-zinc-300 bg-zinc-50 px-3 py-2 text-sm outline-none ring-0 transition focus:border-zinc-900 focus:bg-white"
+                  className="w-full rounded-xl border border-zinc-300 bg-zinc-50 px-3 py-2 text-sm outline-none ring-0 transition focus:border-zinc-900 focus:bg-white text-black"
                 />
                 <p className="text-xs text-zinc-500">
                   We&apos;ll fetch the audio on the server. Nothing is stored
                   unless you are signed in.
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <label
+                  htmlFor="cleanLevel"
+                  className="block text-sm font-medium text-zinc-800"
+                >
+                  Difficulty
+                </label>
+                <select
+                  id="cleanLevel"
+                  value={cleanLevel}
+                  onChange={(event) => setCleanLevel(event.target.value)}
+                  className="w-full rounded-xl border border-zinc-300 bg-zinc-50 px-3 py-2 text-sm outline-none ring-0 transition focus:border-zinc-900 focus:bg-white text-black"
+                >
+                  <option value="simple">Easy – simplified, fewer notes</option>
+                  <option value="balanced">Medium – balanced detail</option>
+                  <option value="detailed">Hard – full detail, more notes</option>
+                </select>
+                <p className="text-xs text-zinc-500">
+                  Controls how complex the arrangement is. Easy removes more tiny
+                  or low‑velocity notes; Hard keeps much more of the original.
                 </p>
               </div>
 
@@ -135,23 +158,35 @@ export default function Home() {
                 <p className="mt-1 text-xs text-zinc-500 break-all">
                   {result.songUrl}
                 </p>
-                <div className="mt-3 flex flex-wrap gap-3">
-                  <a
-                    href={result.pdfUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center justify-center rounded-full border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-800 hover:bg-zinc-100"
-                  >
-                    Download PDF (stub)
-                  </a>
-                  <a
-                    href={result.midiUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center justify-center rounded-full border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-800 hover:bg-zinc-100"
-                  >
-                    Download MIDI (stub)
-                  </a>
+                <div className="mt-4 flex flex-col gap-3">
+                  {result.midiUrl && (
+                    <MidiPlayer
+                      url={result.midiUrl}
+                      timeSignature={result.timeSignature}
+                    />
+                  )}
+                  <div className="flex flex-wrap gap-3">
+                    {result.pdfUrl && (
+                      <a
+                        href={result.pdfUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center justify-center rounded-full border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-800 hover:bg-zinc-100"
+                      >
+                        Download PDF
+                      </a>
+                    )}
+                    {result.midiUrl && (
+                      <a
+                        href={result.midiUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center justify-center rounded-full border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-800 hover:bg-zinc-100"
+                      >
+                        Download MIDI
+                      </a>
+                    )}
+                  </div>
                 </div>
               </div>
             )}

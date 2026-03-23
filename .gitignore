@@ -23,6 +23,14 @@
 # misc
 .DS_Store
 *.pem
+__pycache__/
+*.pyc
+.venv/
+**/.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+transcriber/media/
 
 # debug
 npm-debug.log*

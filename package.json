@@ -6,14 +6,18 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "download-piano": "node scripts/download-piano-samples.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.99.0",
+    "@tonejs/midi": "^2.0.28",
     "next": "16.1.6",
     "next-auth": "^4.24.13",
     "react": "19.2.3",
-    "react-dom": "19.2.3"
+    "react-dom": "19.2.3",
+    "tone": "^15.1.22",
+    "vexflow": "^5.0.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
