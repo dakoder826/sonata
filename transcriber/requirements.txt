@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+requests
+certifi
+basic-pitch
+pretty_midi
+soundfile
+yt-dlp
+librosa
+numpy
