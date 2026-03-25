@@ -3,15 +3,14 @@
 import { useEffect, useRef, useId } from "react";
 
 // Duration quantization for EasyScore tokens.
-// (This is a simplified timing model, tuned to the MIDI cleaning grid.)
-const BPM = 120;
-const SEC_PER_BEAT = 60 / BPM;
-const GRID = SEC_PER_BEAT / 4; // 16th note
+// Uses runtime tempo from the parsed MIDI header when available.
+const DEFAULT_SECONDS_PER_BEAT = 0.5; // 120 BPM fallback
 
 // EasyScore uses `<pitch>/<dur>/r`; pitch sets vertical rest placement. Middle staff
 // lines keep filler rests visually centered (C4/C3 sit toward the ledger-line area).
 const TREBLE_REST_CENTER_PITCH = "B4";
 const BASS_REST_CENTER_PITCH = "D3";
+const PLAYHEAD_X_BIAS_PX = 6;
 
 /**
  * MIDI from multiple tracks often repeats the same pitch at (almost) the same time.
@@ -57,8 +56,8 @@ function uniqNoteNamesPreserveOrder(names) {
   return out;
 }
 
-function durationToCode(sec) {
-  const beats = sec / SEC_PER_BEAT;
+function durationToCode(sec, secPerBeat = DEFAULT_SECONDS_PER_BEAT) {
+  const beats = sec / secPerBeat;
   if (beats <= 0.25) return "16";
   if (beats <= 0.5) return "8";
   if (beats <= 1) return "q";
@@ -127,7 +126,27 @@ function buildEasyScoreMeasure(
   notes,
   maxBeats = 4,
   restPitch = TREBLE_REST_CENTER_PITCH,
+  secPerBeat = DEFAULT_SECONDS_PER_BEAT,
 ) {
+  function fitDurationCode(sec, beatsRemaining) {
+    const candidates = [
+      ["w", 4],
+      ["h", 2],
+      ["q", 1],
+      ["8", 0.5],
+      ["16", 0.25],
+    ];
+    const target = codeToBeats(durationToCode(sec, secPerBeat));
+    // choose closest duration <= remaining beats
+    let best = null;
+    for (const [code, beats] of candidates) {
+      if (beats > beatsRemaining + 1e-6) continue;
+      const score = Math.abs(beats - target);
+      if (!best || score < best.score) best = { code, beats, score };
+    }
+    return best ?? { code: "16", beats: Math.min(0.25, beatsRemaining) };
+  }
+
   const tiePairs = [];
   const slurPairs = [];
 
@@ -142,7 +161,8 @@ function buildEasyScoreMeasure(
   const sorted = [...notes].sort((a, b) => a.time - b.time);
   const parts = [];
   const eventMeta = [];
-  const chordEps = GRID * 0.6;
+  const grid = secPerBeat / 4;
+  const chordEps = grid * 0.42;
   let beatsUsed = 0;
 
   let i = 0;
@@ -152,12 +172,14 @@ function buildEasyScoreMeasure(
       (n) => n.time >= t - chordEps && n.time <= t + chordEps,
     );
     const dur = chord.reduce((s, n) => Math.max(s, n.duration), 0);
-    const code = durationToCode(dur);
-    const noteBeats = codeToBeats(code);
-    if (beatsUsed + noteBeats > maxBeats) {
+    const beatsRemaining = Math.max(0, maxBeats - beatsUsed);
+    if (beatsRemaining <= 1e-6) {
       i += chord.length;
       continue;
     }
+    const fit = fitDurationCode(dur, beatsRemaining);
+    const code = fit.code;
+    const noteBeats = fit.beats;
     const names = uniqNoteNamesPreserveOrder(
       chord
         .map((n) => midiToNoteName(n.midi) ?? sanitizeNoteName(n.name))
@@ -190,9 +212,9 @@ function buildEasyScoreMeasure(
     i += chord.length;
   }
 
-  const TIE_GAP_SEC = GRID * 0.12;
+  const TIE_GAP_SEC = grid * 0.12;
   // Legato slurs: overlap (true MIDI legato) or back-to-back on the grid — not a wide gap.
-  const LEGATO_SLUR_GAP_SEC = GRID * 0.06;
+  const LEGATO_SLUR_GAP_SEC = grid * 0.06;
 
   for (let e = 0; e < eventMeta.length - 1; e++) {
     const a = eventMeta[e];
@@ -416,6 +438,7 @@ export default function StaffNotation({
   onSeek,
   timeSignature = "4/4",
   keySignature = "C",
+  secondsPerBeat = DEFAULT_SECONDS_PER_BEAT,
 }) {
   const containerRef = useRef(null);
   const playheadRef = useRef(null);
@@ -425,8 +448,17 @@ export default function StaffNotation({
   const lineCountRef = useRef(1);
   const totalBeatsRef = useRef(8);
   const lastEventTimeRef = useRef(0);
+  const firstEventTimeRef = useRef(0);
+  const systemXRef = useRef(10);
+  const measureWidthRef = useRef(0);
+  const measureGapRef = useRef(0);
+  const beatsPerMeasureRef = useRef(4);
+  const firstMeasureLeftPadRef = useRef(56);
   const onSeekRef = useRef(onSeek);
   const id = useId().replace(/:/g, "");
+  const secPerBeat = Number.isFinite(secondsPerBeat) && secondsPerBeat > 0
+    ? secondsPerBeat
+    : DEFAULT_SECONDS_PER_BEAT;
   const normalizedKeySignature = normalizeKeySignature(keySignature);
   // Each "line system" contains two 4/4 measures (8 beats total), because we
   // generate `measure1` + `measure2` tickables into a single voice.
@@ -443,12 +475,18 @@ export default function StaffNotation({
 
     const { beatsPerLine } = parseTimeSignature(timeSignature);
 
+    const firstEventTime = Math.max(
+      0,
+      firstEventTimeRef.current ?? Math.min(...notes.map((n) => n.time || 0)),
+    );
     const lastEventTime =
       lastEventTimeRef.current ||
       Math.max(...notes.map((n) => n.time + (n.duration || 0)));
     if (!lastEventTime || !Number.isFinite(lastEventTime)) return;
 
-    const totalBeats = Math.max(beatsPerLine, lastEventTime / SEC_PER_BEAT);
+    const totalBeats = Math.max(beatsPerLine, lastEventTime / secPerBeat);
+    const firstBeat = Math.max(0, firstEventTime / secPerBeat);
+    const lastBeat = Math.max(firstBeat, lastEventTime / secPerBeat);
 
     const width = staffWidthRef.current;
     const playhead = playheadRef.current;
@@ -458,9 +496,10 @@ export default function StaffNotation({
       Math.max(1, Math.ceil(totalBeats / beatsPerLine));
     if (!width || !playhead || !lineHeight || !lineCount) return;
 
-    const clampedTime = Math.max(0, Math.min(currentTime, lastEventTime));
-    const progress = lastEventTime > 0 ? clampedTime / lastEventTime : 0;
-    const positionBeats = progress * totalBeats;
+    const clampedTime = Math.max(firstEventTime, Math.min(currentTime, lastEventTime));
+    const spanTime = Math.max(1e-6, lastEventTime - firstEventTime);
+    const progress = (clampedTime - firstEventTime) / spanTime;
+    const positionBeats = firstBeat + progress * (lastBeat - firstBeat);
     const maxLines = Math.max(
       1,
       Math.min(lineCount, Math.ceil(totalBeats / beatsPerLine)),
@@ -477,13 +516,37 @@ export default function StaffNotation({
       Math.min(beatsPerLine, clampedBeats - lineStartBeat),
     );
 
-    const left = (withinLineBeats / beatsPerLine) * width;
+    const beatsPerMeasure = Math.max(1, beatsPerMeasureRef.current || 4);
+    const systemX = systemXRef.current || 10;
+    const measureWidth = measureWidthRef.current || width / 2;
+    const measureGap = measureGapRef.current || 0;
+    const firstMeasureLeftPad = Math.max(
+      0,
+      Math.min(measureWidth * 0.45, firstMeasureLeftPadRef.current || 56),
+    );
+
+    let left = 0;
+    if (withinLineBeats <= beatsPerMeasure) {
+      const p = withinLineBeats / beatsPerMeasure;
+      left =
+        systemX +
+        firstMeasureLeftPad +
+        p * Math.max(1, measureWidth - firstMeasureLeftPad);
+    } else {
+      const p = (withinLineBeats - beatsPerMeasure) / beatsPerMeasure;
+      left = systemX + measureWidth + measureGap + p * measureWidth;
+    }
+    left = Math.max(
+      systemX,
+      Math.min(systemX + (measureWidth * 2) + measureGap, left),
+    );
+    left += PLAYHEAD_X_BIAS_PX;
     const top = lineIndex * lineHeight;
 
     playhead.style.left = `${left}px`;
     playhead.style.top = `${top}px`;
     playhead.style.height = `${lineHeight}px`;
-  }, [currentTime, notes, timeSignature]);
+  }, [currentTime, notes, timeSignature, secPerBeat]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -494,12 +557,17 @@ export default function StaffNotation({
 
     const displayNotes = dedupeNearSimultaneousSamePitch(notes);
 
+    const firstEventTime = Math.max(
+      0,
+      Math.min(...displayNotes.map((n) => n.time || 0)),
+    );
     const lastEventTime = Math.max(
       ...displayNotes.map((n) => n.time + (n.duration || 0)),
     );
-    const totalBeats = Math.max(beatsPerLine, lastEventTime / SEC_PER_BEAT);
+    const totalBeats = Math.max(beatsPerLine, lastEventTime / secPerBeat);
     const lines = Math.max(1, Math.ceil(totalBeats / beatsPerLine));
 
+    firstEventTimeRef.current = firstEventTime;
     lastEventTimeRef.current = lastEventTime;
     totalBeatsRef.current = totalBeats;
     lineCountRef.current = lines;
@@ -514,32 +582,34 @@ export default function StaffNotation({
         const endBeat = startBeat + beatsPerLine;
         const lineNotes = sourceNotes
           .map((n) => {
-            const beat = n.time / SEC_PER_BEAT;
+            const beat = n.time / secPerBeat;
             return { ...n, beat };
           })
           .filter((n) => n.beat >= startBeat && n.beat < endBeat)
           .map((n) => ({
             ...n,
-            time: (n.beat - startBeat) * SEC_PER_BEAT,
+            time: (n.beat - startBeat) * secPerBeat,
           }));
         const measure1Notes = lineNotes.filter(
-          (n) => n.time < beatsPerMeasure * SEC_PER_BEAT,
+          (n) => n.time < beatsPerMeasure * secPerBeat,
         );
         const measure2Notes = lineNotes
-          .filter((n) => n.time >= beatsPerMeasure * SEC_PER_BEAT)
+          .filter((n) => n.time >= beatsPerMeasure * secPerBeat)
           .map((n) => ({
             ...n,
-            time: n.time - beatsPerMeasure * SEC_PER_BEAT,
+            time: n.time - beatsPerMeasure * secPerBeat,
           }));
         const m1 = buildEasyScoreMeasure(
           measure1Notes,
           beatsPerMeasure,
           restPitch,
+          secPerBeat,
         );
         const m2 = buildEasyScoreMeasure(
           measure2Notes,
           beatsPerMeasure,
           restPitch,
+          secPerBeat,
         );
         result.push([m1, m2]);
       }
@@ -575,7 +645,7 @@ export default function StaffNotation({
     lineCountRef.current = totalLines;
 
     const wrapper = document.createElement("div");
-    wrapper.style.overflowX = "auto";
+    wrapper.style.overflowX = "hidden";
     wrapper.style.overflowY = "auto";
     // Fixed viewport height so we can auto-scroll when the playhead moves (we scroll for the user)
     const scrollAreaHeight = Math.min(
@@ -588,8 +658,9 @@ export default function StaffNotation({
 
     const inner = document.createElement("div");
     inner.style.position = "relative";
-    inner.style.width = `${width}px`;
+    inner.style.width = "100%";
     inner.style.minHeight = `${height}px`;
+    inner.style.overflow = "hidden";
 
     // Canvas (not SVG) so stems and SMuFL noteheads share one rasterized surface—avoids
     // the common “gap” between head and stem from SVG stroke vs text misalignment.
@@ -623,15 +694,18 @@ export default function StaffNotation({
       const rect = scrollEl.getBoundingClientRect();
       const clientX = "clientX" in event ? event.clientX : 0;
       const clientY = "clientY" in event ? event.clientY : 0;
-      const x = clientX - rect.left + scrollEl.scrollLeft;
+      const x = clientX - rect.left + scrollEl.scrollLeft - PLAYHEAD_X_BIAS_PX;
       const y = clientY - rect.top + scrollEl.scrollTop;
 
       const width = staffWidthRef.current || rect.width || 1;
       const lineHeight = lineHeightRef.current || 1;
       const { beatsPerLine: bpl } = parseTimeSignature(timeSignature);
       const totalBeatsLocal = totalBeatsRef.current || bpl;
+      const firstEventTimeLocal = Math.max(0, firstEventTimeRef.current || 0);
       const lastEventTimeLocal = lastEventTimeRef.current || 0;
       if (!lastEventTimeLocal || !Number.isFinite(lastEventTimeLocal)) return;
+      const firstBeatLocal = Math.max(0, firstEventTimeLocal / secPerBeat);
+      const lastBeatLocal = Math.max(firstBeatLocal, lastEventTimeLocal / secPerBeat);
 
       const maxLines =
         lineCountRef.current || Math.ceil(totalBeatsLocal / bpl) || 1;
@@ -639,13 +713,47 @@ export default function StaffNotation({
         0,
         Math.min(maxLines - 1, Math.floor(y / lineHeight)),
       );
-      const withinLineBeats = Math.max(
+      const beatsPerMeasure = Math.max(1, beatsPerMeasureRef.current || 4);
+      const systemX = systemXRef.current || 10;
+      const measureWidth = measureWidthRef.current || width / 2;
+      const measureGap = measureGapRef.current || 0;
+      const firstMeasureLeftPad = Math.max(
         0,
-        Math.min(bpl, (x / width) * bpl),
+        Math.min(measureWidth * 0.45, firstMeasureLeftPadRef.current || 56),
       );
-      const beatsPos = lineIndex * bpl + withinLineBeats;
+
+      let withinLineBeatsMapped = 0;
+      const firstMeasureStartX = systemX + firstMeasureLeftPad;
+      const firstMeasureEndX = systemX + measureWidth;
+      const secondMeasureStartX = firstMeasureEndX + measureGap;
+      const secondMeasureEndX = secondMeasureStartX + measureWidth;
+
+      if (x <= firstMeasureStartX) {
+        withinLineBeatsMapped = 0;
+      } else if (x <= firstMeasureEndX) {
+        const p =
+          (x - firstMeasureStartX) /
+          Math.max(1, firstMeasureEndX - firstMeasureStartX);
+        withinLineBeatsMapped = p * beatsPerMeasure;
+      } else if (x <= secondMeasureStartX) {
+        withinLineBeatsMapped = beatsPerMeasure;
+      } else if (x <= secondMeasureEndX) {
+        const p = (x - secondMeasureStartX) / Math.max(1, measureWidth);
+        withinLineBeatsMapped = beatsPerMeasure + p * beatsPerMeasure;
+      } else {
+        withinLineBeatsMapped = bpl;
+      }
+
+      const beatsPos = lineIndex * bpl + withinLineBeatsMapped;
       const clampedBeats = Math.max(0, Math.min(totalBeatsLocal, beatsPos));
-      const time = (clampedBeats / totalBeatsLocal) * lastEventTimeLocal;
+      const clampedWithinWindow = Math.max(
+        firstBeatLocal,
+        Math.min(lastBeatLocal, clampedBeats),
+      );
+      const beatSpan = Math.max(1e-6, lastBeatLocal - firstBeatLocal);
+      const progress = (clampedWithinWindow - firstBeatLocal) / beatSpan;
+      const time =
+        firstEventTimeLocal + progress * (lastEventTimeLocal - firstEventTimeLocal);
 
       onSeekRef.current(time);
     };
@@ -687,6 +795,15 @@ export default function StaffNotation({
         const measureGap = 0;
         const systemWidth = width - 20;
         const measureWidth = (systemWidth - measureGap) / 2;
+    systemXRef.current = systemX;
+    measureWidthRef.current = measureWidth;
+    measureGapRef.current = measureGap;
+    beatsPerMeasureRef.current = beatsPerMeasure;
+    // Gutter occupied by clef/key/time at the start of each row.
+    firstMeasureLeftPadRef.current = Math.max(
+      54,
+      Math.min(84, measureWidth * 0.31),
+    );
 
         let loggedTooManyTicks = false;
 
@@ -884,7 +1001,7 @@ export default function StaffNotation({
       staffScrollRef.current = null;
       wrapper.removeEventListener("mousedown", handlePointer);
     };
-  }, [notes, id, timeSignature, normalizedKeySignature]);
+  }, [notes, id, timeSignature, normalizedKeySignature, secPerBeat]);
 
   if (!notes.length) return null;
 

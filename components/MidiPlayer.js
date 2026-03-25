@@ -5,6 +5,218 @@ import * as Tone from "tone";
 import { Midi } from "@tonejs/midi";
 import StaffNotation from "./StaffNotation";
 
+const DEFAULT_PLAYHEAD_LAG_SEC = 0.1;
+
+function estimatePlayheadLagSec() {
+  try {
+    const toneCtx = Tone.getContext?.();
+    const ac = toneCtx?.rawContext || toneCtx?.context || null;
+    const lookAhead = Number(toneCtx?.lookAhead) || 0;
+    const baseLatency = ac && Number.isFinite(ac.baseLatency) ? ac.baseLatency : 0;
+    const outputLatency = ac && Number.isFinite(ac.outputLatency) ? ac.outputLatency : 0;
+    // Tiny cushion for sampler attack/decoder jitter.
+    return Math.max(0.02, Math.min(0.25, lookAhead + baseLatency + outputLatency + 0.01));
+  } catch {
+    return DEFAULT_PLAYHEAD_LAG_SEC;
+  }
+}
+
+function dedupeNearSimultaneousSamePitch(noteList, timeTolSec = 0.001) {
+  if (!Array.isArray(noteList) || noteList.length === 0) return [];
+  const sorted = [...noteList].sort((a, b) => {
+    const dt = (a.time || 0) - (b.time || 0);
+    if (dt !== 0) return dt;
+    return (a.midi ?? 0) - (b.midi ?? 0);
+  });
+  const out = [];
+  for (const n of sorted) {
+    const prev = out[out.length - 1];
+    if (
+      prev &&
+      prev.midi === n.midi &&
+      Math.abs((n.time || 0) - (prev.time || 0)) < timeTolSec
+    ) {
+      const pd = prev.duration || 0;
+      const nd = n.duration || 0;
+      if (nd > pd) out[out.length - 1] = { ...prev, ...n, duration: nd };
+      continue;
+    }
+    out.push(n);
+  }
+  return out;
+}
+
+const DEFAULT_SECONDS_PER_BEAT = 0.5;
+
+function parseTimeSignatureForLayout(ts) {
+  const m = String(ts ?? "4/4")
+    .trim()
+    .match(/^(\d+)\s*\/\s*(\d+)$/);
+  const num = m ? Math.max(1, Math.min(16, parseInt(m[1], 10))) : 4;
+  const den = m ? Math.max(1, Math.min(32, parseInt(m[2], 10))) : 4;
+  const beatsPerMeasure = den === 4 || den === 2 ? num : 4;
+  return { beatsPerMeasure };
+}
+
+function durationToCode(sec, secPerBeat = DEFAULT_SECONDS_PER_BEAT) {
+  const beats = sec / secPerBeat;
+  if (beats <= 0.25) return "16";
+  if (beats <= 0.5) return "8";
+  if (beats <= 1) return "q";
+  if (beats <= 2) return "h";
+  return "w";
+}
+
+function codeToBeats(code) {
+  switch (code) {
+    case "16":
+      return 0.25;
+    case "8":
+      return 0.5;
+    case "q":
+      return 1;
+    case "h":
+      return 2;
+    case "w":
+      return 4;
+    default:
+      return 1;
+  }
+}
+
+function fitDurationBeats(sec, beatsRemaining, secPerBeat) {
+  const candidates = [
+    ["w", 4],
+    ["h", 2],
+    ["q", 1],
+    ["8", 0.5],
+    ["16", 0.25],
+  ];
+  const target = codeToBeats(durationToCode(sec, secPerBeat));
+  let best = null;
+  for (const [, beats] of candidates) {
+    if (beats > beatsRemaining + 1e-6) continue;
+    const score = Math.abs(beats - target);
+    if (!best || score < best.score) best = { beats, score };
+  }
+  return best ? best.beats : Math.min(0.25, beatsRemaining);
+}
+
+function sanitizePlayableNotesForStaffAndAudio(
+  noteList,
+  secPerBeat,
+  timeSignature,
+) {
+  if (!Array.isArray(noteList) || noteList.length === 0) return [];
+  const spb =
+    Number.isFinite(secPerBeat) && secPerBeat > 0
+      ? secPerBeat
+      : DEFAULT_SECONDS_PER_BEAT;
+  const { beatsPerMeasure } = parseTimeSignatureForLayout(timeSignature);
+  const grid = spb / 4;
+  const chordEps = grid * 0.42;
+
+  // Keep index references so we can return exact original note objects.
+  const indexed = noteList.map((n, idx) => ({ ...n, __idx: idx }));
+  const kept = new Set();
+
+  function processHand(sourceNotes) {
+    const byMeasure = new Map();
+    for (const n of sourceNotes) {
+      const beat = (Number(n.time) || 0) / spb;
+      const measureIdx = Math.max(0, Math.floor(beat / beatsPerMeasure));
+      if (!byMeasure.has(measureIdx)) byMeasure.set(measureIdx, []);
+      byMeasure.get(measureIdx).push({
+        ...n,
+        localTime: (beat - measureIdx * beatsPerMeasure) * spb,
+      });
+    }
+
+    for (const [, measureNotes] of byMeasure) {
+      const sorted = [...measureNotes].sort((a, b) => a.localTime - b.localTime);
+      let beatsUsed = 0;
+      let i = 0;
+      while (i < sorted.length && beatsUsed < beatsPerMeasure) {
+        const t = sorted[i].localTime;
+        const chord = sorted.filter(
+          (n) => n.localTime >= t - chordEps && n.localTime <= t + chordEps,
+        );
+        const dur = chord.reduce((s, n) => Math.max(s, Number(n.duration) || 0), 0);
+        const beatsRemaining = Math.max(0, beatsPerMeasure - beatsUsed);
+        if (beatsRemaining <= 1e-6) {
+          i += chord.length;
+          continue;
+        }
+
+        const hasRenderable = chord.some(
+          (n) =>
+            Number.isFinite(Number(n.midi)) ||
+            (typeof n.name === "string" && n.name.trim().length > 0),
+        );
+        if (!hasRenderable) {
+          i += chord.length;
+          continue;
+        }
+
+        for (const n of chord) kept.add(n.__idx);
+        beatsUsed += fitDurationBeats(dur, beatsRemaining, spb);
+        i += chord.length;
+      }
+    }
+  }
+
+  processHand(indexed.filter((n) => (Number(n.midi) || 0) >= 60));
+  processHand(indexed.filter((n) => (Number(n.midi) || 0) < 60));
+
+  return indexed
+    .filter((n) => kept.has(n.__idx))
+    .map(({ __idx, ...n }) => n)
+    .sort((a, b) => (a.time || 0) - (b.time || 0));
+}
+
+function smoothDurationsForPlayback(noteList, secPerBeat) {
+  if (!Array.isArray(noteList) || noteList.length === 0) return [];
+  const spb =
+    Number.isFinite(secPerBeat) && secPerBeat > 0
+      ? secPerBeat
+      : DEFAULT_SECONDS_PER_BEAT;
+  const maxBridgeGap = Math.min(0.16, spb * 0.45);
+  const releasePad = 0.012;
+  const sorted = noteList
+    .map((n) => ({
+      ...n,
+      time: Math.max(0, Number(n.time) || 0),
+      duration: Math.max(0.02, Number(n.duration) || 0.02),
+    }))
+    .sort((a, b) => (a.time || 0) - (b.time || 0));
+  const out = sorted.map((n) => ({ ...n }));
+  for (let i = 0; i < out.length; i += 1) {
+    const n = out[i];
+    const nEnd = n.time + n.duration;
+    const nMidi = Number(n.midi) || 0;
+    const thisIsRight = nMidi >= 60;
+    let next = null;
+    for (let j = i + 1; j < out.length; j += 1) {
+      const c = out[j];
+      const cMidi = Number(c.midi) || 0;
+      if ((cMidi >= 60) === thisIsRight) {
+        next = c;
+        break;
+      }
+    }
+    if (!next) continue;
+    const gap = next.time - nEnd;
+    if (gap > 0 && gap <= maxBridgeGap) {
+      const bridgedEnd = Math.min(
+        next.time - releasePad,
+        nEnd + Math.max(0.01, gap * 0.88),
+      );
+      n.duration = Math.max(0.02, bridgedEnd - n.time);
+    }
+  }
+  return out;
+}
+
 // Flatten all notes from all tracks with absolute time, for display
 function flattenNotes(midi) {
   const notes = [];
@@ -20,7 +232,15 @@ function flattenNotes(midi) {
     });
   });
   notes.sort((a, b) => a.time - b.time);
-  return notes;
+  if (!notes.length) return notes;
+  // Trim leading empty space so the playhead starts where notes actually begin.
+  const firstTime = Math.max(0, notes[0].time || 0);
+  const shifted =
+    firstTime > 0
+      ? notes.map((n) => ({ ...n, time: Math.max(0, n.time - firstTime) }))
+      : notes;
+  // Keep the same dedupe policy as staff rendering so audio and notation align.
+  return dedupeNearSimultaneousSamePitch(shifted);
 }
 
 function timeSignatureFromMidi(midi) {
@@ -204,15 +424,20 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
     timeSignatureProp?.trim() || "4/4",
   );
   const [keySignature, setKeySignature] = useState("C");
+  const [secondsPerBeat, setSecondsPerBeat] = useState(0.5);
   const [currentTime, setCurrentTime] = useState(0);
   const [totalDuration, setTotalDuration] = useState(0);
   const startOffsetRef = useRef(0);
   const playTimeoutRef = useRef(null);
   const lastUrlRef = useRef(null);
-  const intervalRef = useRef(null);
+  const rafRef = useRef(null);
+  const playheadLagRef = useRef(DEFAULT_PLAYHEAD_LAG_SEC);
   const midiRef = useRef(null);
   const samplerRef = useRef(null);
   const partRef = useRef(null);
+  const playbackNotesRef = useRef([]);
+  const noteStartRef = useRef(0);
+  const noteEndRef = useRef(0);
 
   // Parse the MIDI as soon as we have a URL so that
   // - we can render the staff *before* playback
@@ -246,32 +471,47 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
         lastUrlRef.current = midiUrl;
 
         const flatNotes = flattenNotes(midi);
-        setNotes(flatNotes);
+        noteStartRef.current =
+          flatNotes.length > 0 ? Math.max(0, midi.tracks.flatMap((t) => t.notes).reduce((m, n) => Math.min(m, n.time), Number.POSITIVE_INFINITY)) : 0;
 
         const fromMidi = timeSignatureFromMidi(midi);
-        setTimeSignature(
-          (timeSignatureProp && timeSignatureProp.trim()) ||
-            fromMidi ||
-            "4/4",
-        );
+        const resolvedTimeSignature =
+          (timeSignatureProp && timeSignatureProp.trim()) || fromMidi || "4/4";
+        setTimeSignature(resolvedTimeSignature);
 
         const keyFromMeta = keySignatureFromMidi(midi);
         const keyFromNotes = inferKeySignatureFromNotes(flatNotes);
         setKeySignature(keyFromMeta || keyFromNotes || "C");
+        const bpmMeta = Number(midi.header?.tempos?.[0]?.bpm);
+        const resolvedSecondsPerBeat =
+          Number.isFinite(bpmMeta) && bpmMeta > 0 ? 60 / bpmMeta : 0.5;
+        setSecondsPerBeat(resolvedSecondsPerBeat);
+        const playbackNotes = smoothDurationsForPlayback(
+          flatNotes,
+          resolvedSecondsPerBeat,
+        );
+        const staffNotes = sanitizePlayableNotesForStaffAndAudio(
+          flatNotes,
+          resolvedSecondsPerBeat,
+          resolvedTimeSignature,
+        );
+        setNotes(staffNotes);
+        playbackNotesRef.current = playbackNotes;
 
         const fullDurationInit =
-          flatNotes.length > 0
-            ? flatNotes.reduce(
+          playbackNotes.length > 0
+            ? playbackNotes.reduce(
                 (max, n) => Math.max(max, n.time + (n.duration || 0)),
                 0,
               )
             : midi.duration || 0;
+        noteEndRef.current = fullDurationInit;
         setTotalDuration(fullDurationInit);
         // Helpful for debugging end-to-end timing vs staff rendering
         // but safe in production as a low-frequency log.
         console.log("MidiPlayer loaded MIDI", {
-          noteCount: flatNotes.length,
-          firstTime: flatNotes[0]?.time ?? 0,
+          noteCount: playbackNotes.length,
+          firstTime: playbackNotes[0]?.time ?? 0,
           lastEndTime: fullDurationInit,
         });
       } catch (err) {
@@ -290,22 +530,25 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url, timeSignatureProp]);
 
-  // Update currentTime during playback based on wall-clock time + start offset
+  // Update currentTime during playback based on Transport + measured output lag.
   useEffect(() => {
     if (!isPlaying || totalDuration <= 0) return;
     // Drive UI time from Tone.Transport which is synced to the audio context.
-    // performance.now() can be slightly offset from audio start (often visible on
-    // the very first note).
-    const VISUAL_LEAD = 0.0;
-    intervalRef.current = setInterval(() => {
+    // In practice the audible sampler attack lags Transport, so keep the
+    // playhead behind to match what users actually hear.
+    const tick = () => {
       const transport = Tone.getTransport();
-      const t =
-        (startOffsetRef.current ?? 0) + (transport.seconds ?? 0) + VISUAL_LEAD;
+      const lag = playheadLagRef.current ?? DEFAULT_PLAYHEAD_LAG_SEC;
+      const t = (startOffsetRef.current ?? 0) + (transport.seconds ?? 0) - lag;
       const clamped = Math.max(0, Math.min(totalDuration, t));
       setCurrentTime(clamped);
-    }, 30);
+      rafRef.current = requestAnimationFrame(tick);
+    };
+
+    rafRef.current = requestAnimationFrame(tick);
     return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
     };
   }, [isPlaying, totalDuration]);
 
@@ -332,15 +575,37 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
           lastUrlRef.current = url;
 
           const flatNotes = flattenNotes(midi);
-          setNotes(flatNotes);
+          const fallbackTimeSignature =
+            (timeSignatureProp && timeSignatureProp.trim()) ||
+            timeSignatureFromMidi(midi) ||
+            "4/4";
+          setTimeSignature(fallbackTimeSignature);
+          const bpmMeta = Number(midi.header?.tempos?.[0]?.bpm);
+          const fallbackSecondsPerBeat =
+            Number.isFinite(bpmMeta) && bpmMeta > 0 ? 60 / bpmMeta : 0.5;
+          setSecondsPerBeat(fallbackSecondsPerBeat);
+          const playbackNotes = smoothDurationsForPlayback(
+            flatNotes,
+            fallbackSecondsPerBeat,
+          );
+          const staffNotes = sanitizePlayableNotesForStaffAndAudio(
+            flatNotes,
+            fallbackSecondsPerBeat,
+            fallbackTimeSignature,
+          );
+          setNotes(staffNotes);
+          playbackNotesRef.current = playbackNotes;
+          noteStartRef.current =
+            flatNotes.length > 0 ? Math.max(0, midi.tracks.flatMap((t) => t.notes).reduce((m, n) => Math.min(m, n.time), Number.POSITIVE_INFINITY)) : 0;
 
           const fullDurationInit =
-            flatNotes.length > 0
-              ? flatNotes.reduce(
+            playbackNotes.length > 0
+              ? playbackNotes.reduce(
                   (max, n) => Math.max(max, n.time + (n.duration || 0)),
                   0,
                 )
               : midi.duration || 0;
+          noteEndRef.current = fullDurationInit;
           setTotalDuration(fullDurationInit);
         } catch (loadErr) {
           console.error("Fallback MIDI load failed:", loadErr);
@@ -353,12 +618,13 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
         throw new Error("No MIDI data to play.");
       }
 
-      const fullDuration = midi.duration || 0;
+      const fullDuration = Math.max(0, noteEndRef.current || 0);
       const startOffset = Math.max(
         0,
         Math.min(offsetSeconds || 0, fullDuration || 0),
       );
-      setCurrentTime(startOffset);
+      playheadLagRef.current = estimatePlayheadLagSec();
+      setCurrentTime(Math.max(0, startOffset - playheadLagRef.current));
       startOffsetRef.current = startOffset;
 
       // Stop any existing playback
@@ -418,12 +684,22 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
       // Part only runs when Transport is running.
       // Support starting from an offset by skipping earlier notes and shifting times.
       const events = [];
-      midi.tracks.forEach((track) => {
-        track.notes.forEach((note) => {
-          if (note.time + note.duration <= startOffset) return;
-          const shiftedTime = Math.max(0, note.time - startOffset);
-          events.push([shiftedTime, note]);
-        });
+      const renderNotes = Array.isArray(playbackNotesRef.current)
+        ? playbackNotesRef.current
+        : [];
+      renderNotes.forEach((note) => {
+        const normTime = Math.max(0, Number(note.time) || 0);
+        const normDur = Math.max(0.02, Number(note.duration) || 0.02);
+        if (normTime + normDur <= startOffset) return;
+        if (normTime >= fullDuration + 0.001) return;
+        const shiftedTime = Math.max(0, normTime - startOffset);
+        events.push([
+          shiftedTime,
+          {
+            name: note.name,
+            duration: normDur,
+          },
+        ]);
       });
 
       const part = new Tone.Part((time, note) => {
@@ -448,7 +724,7 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
         sampler.releaseAll?.();
         setIsPlaying(false);
         setIsPaused(false);
-        setCurrentTime(fullDuration);
+        setCurrentTime(Math.max(0, fullDuration - (playheadLagRef.current || DEFAULT_PLAYHEAD_LAG_SEC)));
         playTimeoutRef.current = null;
         startOffsetRef.current = 0;
       }, totalDurationSeconds);
@@ -472,7 +748,7 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
       Math.min(totalDuration, (startOffsetRef.current ?? 0) + elapsed),
     );
 
-    setCurrentTime(pausedAt);
+    setCurrentTime(Math.max(0, pausedAt - (playheadLagRef.current || DEFAULT_PLAYHEAD_LAG_SEC)));
     startOffsetRef.current = pausedAt;
 
     if (playTimeoutRef.current) {
@@ -559,6 +835,7 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
             currentTime={currentTime}
             timeSignature={timeSignature}
             keySignature={keySignature}
+            secondsPerBeat={secondsPerBeat}
             onSeek={(time) => {
               setCurrentTime(time);
               if (isPlaying) {

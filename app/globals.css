@@ -1,8 +1,9 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* Piano-style landing: near-black field, ivory text */
+  --background: #0a0a0a;
+  --foreground: #fafafa;
 }
 
 @theme inline {
@@ -12,15 +13,97 @@
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+}
+
+/* Typewriter headline caret — ~50/50 on/off like a terminal cursor */
+@keyframes typewriter-caret-blink {
+  0%,
+  50% {
+    opacity: 1;
+  }
+  50.01%,
+  100% {
+    opacity: 0;
+  }
+}
+
+.typewriter-caret {
+  animation: typewriter-caret-blink 1.06s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .typewriter-caret {
+    animation: none;
+    opacity: 1;
+  }
+}
+
+/* Floating piano notes (background decoration) — solid white, motion via transform + opacity */
+.floating-note {
+  color: #ffffff;
+  will-change: transform, opacity;
+}
+
+@keyframes sonata-float-a {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) rotate(-10deg);
+    opacity: 0.28;
+  }
+  50% {
+    transform: translate3d(12vw, -22vh, 0) rotate(14deg);
+    opacity: 0.5;
+  }
+}
+
+@keyframes sonata-float-b {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) rotate(12deg);
+    opacity: 0.26;
+  }
+  50% {
+    transform: translate3d(-14vw, 18vh, 0) rotate(-16deg);
+    opacity: 0.48;
+  }
+}
+
+@keyframes sonata-float-c {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) rotate(0deg);
+    opacity: 0.3;
+  }
+  33% {
+    transform: translate3d(16vw, 10vh, 0) rotate(11deg);
+    opacity: 0.52;
+  }
+  66% {
+    transform: translate3d(-10vw, -20vh, 0) rotate(-9deg);
+    opacity: 0.35;
+  }
+}
+
+@keyframes sonata-float-d {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1) rotate(8deg);
+    opacity: 0.25;
+  }
+  50% {
+    transform: translate3d(-12vw, -24vh, 0) scale(1.15) rotate(-12deg);
+    opacity: 0.45;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .floating-notes-layer .floating-note {
+    animation: none !important;
+    opacity: 0.22 !important;
+    transform: none !important;
+  }
 }

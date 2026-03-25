@@ -13,6 +13,20 @@ export async function POST(request) {
       });
     }
 
+    if (
+      cleanLevel != null &&
+      cleanLevel !== "" &&
+      cleanLevel !== "simple" &&
+      cleanLevel !== "regular"
+    ) {
+      return new Response(
+        JSON.stringify({
+          error: "cleanLevel must be 'simple' or 'regular'.",
+        }),
+        { status: 400 },
+      );
+    }
+
     const session = await getServerSession(authConfig);
     const userId = session?.user?.id ?? null;
 
@@ -74,10 +88,10 @@ export async function POST(request) {
         body: JSON.stringify({
           audio_url: songUrl,
           use_separation: true,
-          clean_level:
-            cleanLevel === "simple" || cleanLevel === "detailed"
-              ? cleanLevel
-              : "balanced",
+          // Two user-facing modes:
+          // - simple -> simple cleanup profile
+          // - regular -> balanced cleanup profile
+          clean_level: cleanLevel === "simple" ? "simple" : "balanced",
         }),
       },
     );
