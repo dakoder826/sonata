@@ -2,6 +2,43 @@ import { getServerSession } from "next-auth";
 import { authConfig } from "@/auth.config";
 import { createSupabaseServerClient } from "@/lib/supabaseServer";
 
+export async function GET() {
+  try {
+    const session = await getServerSession(authConfig);
+    const userId = session?.user?.id ?? null;
+
+    if (!userId) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401,
+      });
+    }
+
+    const supabase = createSupabaseServerClient();
+    const { data, error } = await supabase
+      .from("transcriptions")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error("Error fetching transcriptions:", error);
+      return new Response(
+        JSON.stringify({ error: "Failed to load saved piano sheets." }),
+        {
+          status: 500,
+        },
+      );
+    }
+
+    return new Response(JSON.stringify({ items: data ?? [] }), { status: 200 });
+  } catch (error) {
+    console.error("GET /api/transcriptions error:", error);
+    return new Response(JSON.stringify({ error: "Something went wrong." }), {
+      status: 500,
+    });
+  }
+}
+
 export async function POST(request) {
   try {
     const body = await request.json();
@@ -31,15 +68,17 @@ export async function POST(request) {
     const userId = session?.user?.id ?? null;
 
     let transcriptionId = null;
+    const supabase = userId ? createSupabaseServerClient() : null;
 
     if (userId) {
       try {
-        const supabase = createSupabaseServerClient();
         const { data, error } = await supabase
           .from("transcriptions")
           .insert({
             user_id: userId,
             song_url: songUrl,
+            clean_level: cleanLevel === "simple" ? "simple" : "regular",
+            status: "processing",
           })
           .select("id")
           .single();
@@ -102,6 +141,21 @@ export async function POST(request) {
         "Transcriber service error:",
         data || serviceResponse.status,
       );
+
+      if (userId && transcriptionId) {
+        await supabase
+          .from("transcriptions")
+          .update({
+            status: "failed",
+            error_message:
+              data?.error ||
+              data?.detail ||
+              "Failed to generate sheet from this song URL.",
+          })
+          .eq("id", transcriptionId)
+          .eq("user_id", userId);
+      }
+
       return new Response(
         JSON.stringify({
           error:
@@ -117,6 +171,19 @@ export async function POST(request) {
 
     if (!serviceData?.midi_url) {
       console.error("Transcriber service returned no midi_url:", serviceData);
+
+      if (userId && transcriptionId) {
+        await supabase
+          .from("transcriptions")
+          .update({
+            status: "failed",
+            error_message:
+              "Transcription service did not return a generated file.",
+          })
+          .eq("id", transcriptionId)
+          .eq("user_id", userId);
+      }
+
       return new Response(
         JSON.stringify({
           error:
@@ -134,6 +201,26 @@ export async function POST(request) {
       pdfUrl: serviceData.pdf_url ?? null,
       timeSignature: serviceData.time_signature ?? "4/4",
     };
+
+    if (userId && transcriptionId) {
+      const { error: updateError } = await supabase
+        .from("transcriptions")
+        .update({
+          midi_url: result.midiUrl,
+          raw_midi_url: result.rawMidiUrl,
+          pdf_url: result.pdfUrl,
+          time_signature: result.timeSignature,
+          clean_level: cleanLevel === "simple" ? "simple" : "regular",
+          status: "completed",
+          error_message: null,
+        })
+        .eq("id", transcriptionId)
+        .eq("user_id", userId);
+
+      if (updateError) {
+        console.error("Failed to update transcription record:", updateError);
+      }
+    }
 
     return new Response(JSON.stringify(result), { status: 200 });
   } catch (error) {

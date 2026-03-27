@@ -1302,15 +1302,15 @@ export default function StaffNotation({
 
   return (
     <div className="w-full rounded-xl border border-zinc-200 bg-white">
-      <p className="text-[10px] font-medium text-zinc-500 uppercase tracking-wide px-2 pt-2 pb-1">
+      <p className="px-2 pt-2 pb-1 text-[10px] font-medium tracking-wide text-zinc-500 uppercase">
         Staff notation
-        <span className="normal-case text-zinc-400">
+        <span className="text-zinc-400 normal-case">
           {` · ${headerMeter} · ${headerKey}`}
         </span>
       </p>
       <div
         ref={containerRef}
-        className="min-h-[140px] flex items-center justify-start"
+        className="flex min-h-[140px] items-center justify-start"
       />
     </div>
   );

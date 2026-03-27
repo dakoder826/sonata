@@ -459,7 +459,11 @@ function noteToMidi(name) {
   return (parseInt(octave, 10) + 1) * 12 + (steps[step] ?? 0);
 }
 
-export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
+export default function MidiPlayer({
+  url,
+  timeSignature: timeSignatureProp,
+  notationOnly = false,
+}) {
   const [isLoading, setIsLoading] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
@@ -683,19 +687,8 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
       setPlayheadTime(snapToLatestOnset(onsetTimesRef.current, startOffset));
       startOffsetRef.current = startOffset;
 
-      // Stop any existing playback
-      const transport = Tone.getTransport();
-      transport.stop();
-      transport.seconds = 0;
-      if (partRef.current) {
-        partRef.current.dispose();
-        partRef.current = null;
-      }
-      if (playTimeoutRef.current) {
-        clearTimeout(playTimeoutRef.current);
-        playTimeoutRef.current = null;
-      }
-      samplerRef.current?.releaseAll?.();
+      // Stop any existing playback before starting a new one.
+      stopPlaybackEngine();
 
       // Ensure audio context is running (required after user gesture in many browsers)
       const ctx = Tone.getContext();
@@ -822,20 +815,32 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
     setPlayheadTime(snapToLatestOnset(onsetTimesRef.current, pausedAt));
     startOffsetRef.current = pausedAt;
 
+    stopPlaybackEngine();
+
+    setIsPlaying(false);
+    setIsPaused(true);
+  }
+
+  function stopPlaybackEngine() {
     if (playTimeoutRef.current) {
       clearTimeout(playTimeoutRef.current);
       playTimeoutRef.current = null;
     }
-
+    const transport = Tone.getTransport();
     transport.stop();
     transport.seconds = 0;
     partRef.current?.dispose();
     partRef.current = null;
     samplerRef.current?.releaseAll?.();
-
-    setIsPlaying(false);
-    setIsPaused(true);
   }
+
+  // Ensure playback stops if user leaves the page/component.
+  useEffect(() => {
+    return () => {
+      stopPlaybackEngine();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function handlePlayClick() {
     if (!url || isLoading || isPlaying) return;
@@ -850,71 +855,79 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex items-center gap-2">
-        <button
-          type="button"
-          onClick={handlePlayClick}
-          disabled={!url || isLoading || isPlaying}
-          className="inline-flex items-center justify-center rounded-full border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-800 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          {isLoading
-            ? "Loading..."
-            : isPlaying
-              ? "Playing..."
-              : isPaused
-                ? "Resume preview"
-                : "Play preview"}
-        </button>
-        <button
-          type="button"
-          onClick={handlePauseClick}
-          disabled={!isPlaying || isLoading}
-          className="inline-flex items-center justify-center rounded-full border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-800 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          Pause
-        </button>
-        {totalDuration > 0 && (
-          <span className="text-xs text-zinc-500">
-            {formatTime(currentTime)} / {formatTime(totalDuration)}
-          </span>
-        )}
-      </div>
+      {!notationOnly && (
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handlePlayClick}
+            disabled={!url || isLoading || isPlaying}
+            className="inline-flex items-center justify-center rounded-full border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-800 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {isLoading
+              ? "Loading..."
+              : isPlaying
+                ? "Playing..."
+                : isPaused
+                  ? "Resume preview"
+                  : "Play preview"}
+          </button>
+          <button
+            type="button"
+            onClick={handlePauseClick}
+            disabled={!isPlaying || isLoading}
+            className="inline-flex items-center justify-center rounded-full border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-800 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Pause
+          </button>
+          {totalDuration > 0 && (
+            <span className="text-xs text-zinc-500">
+              {formatTime(currentTime)} / {formatTime(totalDuration)}
+            </span>
+          )}
+        </div>
+      )}
 
       {notes.length > 0 && (
         <>
-          <div className="mt-1">
-            {totalDuration > 0 && (
-              <input
-                type="range"
-                min={0}
-                max={totalDuration}
-                step={0.01}
-                value={currentTime}
-                onChange={(event) => {
-                  const time = parseFloat(event.target.value) || 0;
-                  setCurrentTime(time);
-                  setPlayheadTime(time);
-                  if (isPlaying) {
-                    playFrom(time);
-                  }
-                }}
-                className="w-full"
-              />
-            )}
-          </div>
+          {!notationOnly && (
+            <div className="mt-1">
+              {totalDuration > 0 && (
+                <input
+                  type="range"
+                  min={0}
+                  max={totalDuration}
+                  step={0.01}
+                  value={currentTime}
+                  onChange={(event) => {
+                    const time = parseFloat(event.target.value) || 0;
+                    setCurrentTime(time);
+                    setPlayheadTime(time);
+                    if (isPlaying) {
+                      playFrom(time);
+                    }
+                  }}
+                  className="w-full"
+                />
+              )}
+            </div>
+          )}
           <StaffNotation
             notes={notes}
             currentTime={playheadTime}
             timeSignature={timeSignature}
             keySignature={keySignature}
             secondsPerBeat={secondsPerBeat}
-            onSeek={(time) => {
-              setCurrentTime(time);
-              setPlayheadTime(time);
-              if (isPlaying) {
-                playFrom(time);
-              }
-            }}
+            onSeek={
+              notationOnly
+                ? undefined
+                : (time) => {
+                    setCurrentTime(time);
+                    setPlayheadTime(time);
+                    if (isPlaying) {
+                      playFrom(time);
+                    }
+                  }
+            }
           />
         </>
       )}
