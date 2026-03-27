@@ -76,6 +76,7 @@ class TranscriptionRequest(BaseModel):
 
 class TranscriptionResponse(BaseModel):
     midi_url: str
+    raw_midi_url: str | None = None
     pdf_url: str | None = None
     time_signature: str = "4/4"  # e.g. "3/4", "4/4" — also embedded in MIDI
 
@@ -276,6 +277,8 @@ def _arrange_playable_piano(
     - Balanced: fuller arrangement while still thinned vs raw model output.
     """
     if level == "simple":
+        # Keep easy mode clearly lighter than balanced in dense buckets,
+        # but allow a small melody-support pair so songs stay recognizable.
         max_rh, max_lh = 2, 1
     else:
         max_rh, max_lh = 4, 3
@@ -300,23 +303,50 @@ def _arrange_playable_piano(
                 rh.sort(key=lambda n: (n.pitch, n.velocity))
                 if len(rh) > max_rh:
                     if level == "simple":
-                        # Melody continuity: keep highest note + one that best connects
-                        # to the previous RH center (or next-highest when unknown).
-                        highest = rh[-1]
+                        # Prioritize melodic continuity + top-line identity.
                         if prev_rh_pitch is None:
-                            companion = rh[-2]
+                            contour = max(
+                                rh, key=lambda n: (n.pitch, n.velocity, n.end - n.start)
+                            )
                         else:
-                            companion = min(
-                                rh[:-1],
+                            contour = min(
+                                rh,
                                 key=lambda n: (
                                     abs(n.pitch - prev_rh_pitch),
                                     -n.velocity,
+                                    -n.pitch,
                                 ),
                             )
-                        rh_keep = sorted(
-                            {id(highest): highest, id(companion): companion}.values(),
-                            key=lambda n: (n.pitch, n.velocity),
-                        )
+                        top = max(rh, key=lambda n: (n.pitch, n.velocity, n.end - n.start))
+                        rh_keep = []
+                        seen = set()
+                        for cand in (contour, top):
+                            key = (cand.pitch, round(cand.start, 4), round(cand.end, 4))
+                            if key in seen:
+                                continue
+                            rh_keep.append(cand)
+                            seen.add(key)
+                            if len(rh_keep) >= max_rh:
+                                break
+
+                        if len(rh_keep) < max_rh:
+                            remaining = sorted(
+                                rh,
+                                key=lambda n: (
+                                    n.velocity,
+                                    n.end - n.start,
+                                    -abs(n.pitch - contour.pitch),
+                                ),
+                                reverse=True,
+                            )
+                            for n in remaining:
+                                key = (n.pitch, round(n.start, 4), round(n.end, 4))
+                                if key in seen:
+                                    continue
+                                rh_keep.append(n)
+                                seen.add(key)
+                                if len(rh_keep) >= max_rh:
+                                    break
                     else:
                         rh_keep = rh[-max_rh:]
                 else:
@@ -371,6 +401,54 @@ def _clone_pretty_midi(pm: pretty_midi.PrettyMIDI) -> pretty_midi.PrettyMIDI:
     return out
 
 
+def _extract_vocal_anchor_ids(
+    notes: list,
+    bpm: float,
+    level: str,
+    split_pitch: int = 60,
+) -> set:
+    """
+    Identify likely lead/vocal contour anchors from the raw note stream.
+    We use top right-hand notes in short windows as melody proxies and keep
+    their object identities through early cleanup passes.
+    """
+    if not notes:
+        return set()
+
+    tempo = max(40.0, min(240.0, bpm))
+    sec_per_beat = 60.0 / tempo
+    window = sec_per_beat * (0.42 if level == "simple" else 0.34)
+    min_dur = max(0.045, sec_per_beat * 0.08)
+    min_vel = 6
+
+    right = sorted(
+        [
+            n
+            for n in notes
+            if n.pitch >= split_pitch
+            and n.velocity >= min_vel
+            and (n.end - n.start) >= min_dur
+        ],
+        key=lambda n: (n.start, n.pitch, n.end),
+    )
+    if not right:
+        return set()
+
+    kept_ids = set()
+    i = 0
+    while i < len(right):
+        t0 = right[i].start
+        j = i + 1
+        while j < len(right) and right[j].start <= t0 + window:
+            j += 1
+        bucket = right[i:j]
+        chosen = max(bucket, key=lambda n: (n.pitch, n.velocity, n.end - n.start))
+        kept_ids.add(id(chosen))
+        i = j
+
+    return kept_ids
+
+
 def _clean_midi(
     pm: pretty_midi.PrettyMIDI,
     level: str,
@@ -384,12 +462,13 @@ def _clean_midi(
     """
     if level == "simple":  # Easy: preserve flow while still removing obvious noise.
         min_duration = 0.055
-        min_velocity = 8
-        max_notes_per_chord = 4
-        min_rearticulation = 0.095
-        max_chord_span = 20
+        min_velocity = 10
+        max_notes_per_chord = 2
+        # Keep repeated strikes manageable without erasing phrase identity.
+        min_rearticulation = 0.19
+        max_chord_span = 14
         sustain_merge_gap = 0.19
-        max_left_hand_notes = 2
+        max_left_hand_notes = 1
         max_right_hand_notes = 2
     else:  # balanced — closer to the transcription, still cleaned for playback
         min_duration = 0.055
@@ -418,11 +497,22 @@ def _clean_midi(
     velocity_alpha = 0.48 if level == "simple" else 0.58
 
     for instrument in pm.instruments:
+        source_notes = list(instrument.notes)
+        vocal_anchor_ids = _extract_vocal_anchor_ids(
+            source_notes,
+            bpm=tempo,
+            level=level,
+            split_pitch=60,
+        )
         cleaned = []
-        for note in instrument.notes:
+        for note in source_notes:
             dur = note.end - note.start
+            is_vocal_anchor = id(note) in vocal_anchor_ids
             if dur < min_duration or note.velocity < min_velocity:
-                continue
+                if not is_vocal_anchor:
+                    continue
+                note.end = max(note.end, note.start + min_duration)
+                note.velocity = int(max(note.velocity, min_velocity))
             if note.end <= note.start:
                 continue
             cleaned.append(note)
@@ -439,6 +529,9 @@ def _clean_midi(
             median_dur = float(np.median(durations))
             kept = []
             for i, note in enumerate(instrument.notes):
+                if id(note) in vocal_anchor_ids:
+                    kept.append(note)
+                    continue
                 dur = note.end - note.start
                 if dur >= median_dur * blip_ratio:
                     kept.append(note)
@@ -531,6 +624,7 @@ def _clean_midi(
             max_notes_per_chord=max_notes_per_chord,
             min_rearticulation=min_rearticulation,
             max_chord_span=max_chord_span,
+            preserve_note_ids=vocal_anchor_ids,
         )
         instrument.notes = _enforce_hand_density(
             instrument.notes,
@@ -538,6 +632,7 @@ def _clean_midi(
             split_pitch=60,
             max_left=max_left_hand_notes,
             max_right=max_right_hand_notes,
+            preserve_note_ids=vocal_anchor_ids,
         )
         instrument.notes = _retain_rhythmic_anchors(
             instrument.notes,
@@ -551,7 +646,10 @@ def _clean_midi(
             min_overlap=0.0,
         )
         instrument.notes = _prune_decorative_notes(
-            instrument.notes, level=level, bpm=tempo
+            instrument.notes,
+            level=level,
+            bpm=tempo,
+            preserve_note_ids=vocal_anchor_ids,
         )
 
     return pm
@@ -608,6 +706,7 @@ def _enforce_hand_density(
     split_pitch: int,
     max_left: int,
     max_right: int,
+    preserve_note_ids: set | None = None,
 ) -> list:
     """
     Cap simultaneous density per hand region to keep passages playable.
@@ -615,6 +714,7 @@ def _enforce_hand_density(
     if not notes:
         return notes
 
+    protected = preserve_note_ids or set()
     sorted_notes = sorted(notes, key=lambda n: (n.start, n.pitch, n.end))
     out = []
     i = 0
@@ -629,17 +729,25 @@ def _enforce_hand_density(
         right = [n for n in bucket if n.pitch >= split_pitch]
 
         if len(left) > max_left:
-            left = sorted(
-                left,
+            locked = [n for n in left if id(n) in protected]
+            rest = [n for n in left if id(n) not in protected]
+            rest = sorted(
+                rest,
                 key=lambda n: ((n.velocity * 2.0) + (n.end - n.start), -abs(n.pitch - 48)),
                 reverse=True,
-            )[:max_left]
+            )
+            keep = locked + rest[: max(0, max_left - len(locked))]
+            left = sorted(keep, key=lambda n: (n.start, n.pitch, n.end))
         if len(right) > max_right:
-            right = sorted(
-                right,
+            locked = [n for n in right if id(n) in protected]
+            rest = [n for n in right if id(n) not in protected]
+            rest = sorted(
+                rest,
                 key=lambda n: ((n.velocity * 2.0) + (n.end - n.start), -abs(n.pitch - 72)),
                 reverse=True,
-            )[:max_right]
+            )
+            keep = locked + rest[: max(0, max_right - len(locked))]
+            right = sorted(keep, key=lambda n: (n.start, n.pitch, n.end))
 
         out.extend(left + right)
         i = j
@@ -695,7 +803,12 @@ def _retain_rhythmic_anchors(
     return sorted(uniq.values(), key=lambda n: (n.start, n.pitch, n.end))
 
 
-def _prune_decorative_notes(notes: list, level: str, bpm: float) -> list:
+def _prune_decorative_notes(
+    notes: list,
+    level: str,
+    bpm: float,
+    preserve_note_ids: set | None = None,
+) -> list:
     """
     Drop very short, quiet notes that sit alone in time+pitch space — typical
     Basic-Pitch 'sparkles' that make the part feel busy and unplayable.
@@ -705,11 +818,13 @@ def _prune_decorative_notes(notes: list, level: str, bpm: float) -> list:
     if len(notes) < 2:
         return notes
 
+    protected = preserve_note_ids or set()
     tempo = max(40.0, min(240.0, bpm))
     sec_per_beat = 60.0 / tempo
 
     if level == "simple":
-        max_dur, max_vel, t_win, p_win = 0.09, 28, 0.15, 4
+        # More aggressive de-clutter for easy mode.
+        max_dur, max_vel, t_win, p_win = 0.12, 36, 0.17, 3
     else:
         max_dur, max_vel, t_win, p_win = 0.10, 32, 0.18, 6
 
@@ -723,9 +838,12 @@ def _prune_decorative_notes(notes: list, level: str, bpm: float) -> list:
 
     sorted_n = sorted(notes, key=lambda n: (n.start, n.pitch))
     # Do not over-thin sparse regions; these anchors keep phrases from dropping out.
-    sparse_anchor_gap = sec_per_beat * (1.0 if level == "simple" else 0.85)
+    sparse_anchor_gap = sec_per_beat * (1.2 if level == "simple" else 0.85)
     out = []
     for idx, n in enumerate(sorted_n):
+        if id(n) in protected:
+            out.append(n)
+            continue
         dur = n.end - n.start
         if dur >= max_dur or n.velocity >= max_vel:
             out.append(n)
@@ -808,6 +926,97 @@ def _bridge_phrase_gaps(notes: list, level: str, bpm: float, split_pitch: int = 
     return sorted(sorted_notes, key=lambda n: (n.start, n.pitch, n.end))
 
 
+def _limit_local_onset_bursts(
+    notes: list,
+    bpm: float,
+    level: str,
+    split_pitch: int = 60,
+) -> list:
+    """
+    Smooth short-note "flurries" by capping onset density inside short rolling
+    windows. Keeps melodic contour anchors and stronger attacks so identity stays
+    recognizable while improving playability.
+    """
+    if not notes:
+        return notes
+
+    tempo = max(40.0, min(240.0, bpm))
+    sec_per_beat = 60.0 / tempo
+    if level == "simple":
+        # Keep anti-flurry behavior, but preserve enough contour to stay recognizable.
+        window = sec_per_beat * 0.42
+        max_right, max_left = 2, 1
+    else:
+        window = sec_per_beat * 0.3
+        max_right, max_left = 3, 3
+
+    notes_sorted = sorted(notes, key=lambda n: (n.start, n.pitch, n.end))
+
+    def on_strong_beat(t: float) -> bool:
+        pos = (t / sec_per_beat) % 4.0
+        return abs(pos - 0.0) <= 0.14 or abs(pos - 2.0) <= 0.14
+
+    def score_note(n: pretty_midi.Note) -> float:
+        dur = max(0.0, n.end - n.start)
+        strong = 6.0 if on_strong_beat(n.start) else 0.0
+        return (n.velocity * 1.8) + (dur * 40.0) + strong
+
+    def thin_hand(hand_notes: list, keep_high_anchor: bool) -> list:
+        if not hand_notes:
+            return []
+        hand_notes = sorted(hand_notes, key=lambda n: (n.start, n.pitch, n.end))
+        out = []
+        i = 0
+        while i < len(hand_notes):
+            t0 = hand_notes[i].start
+            j = i + 1
+            while j < len(hand_notes) and hand_notes[j].start <= t0 + window:
+                j += 1
+            bucket = hand_notes[i:j]
+            max_bucket = max_right if keep_high_anchor else max_left
+            if len(bucket) <= max_bucket:
+                out.extend(bucket)
+                i = j
+                continue
+
+            anchors = []
+            if keep_high_anchor:
+                anchors.append(max(bucket, key=lambda n: (n.pitch, n.velocity)))
+            else:
+                anchors.append(min(bucket, key=lambda n: (n.pitch, -n.velocity)))
+
+            selected = []
+            seen = set()
+            for n in anchors:
+                k = (n.pitch, round(n.start, 4), round(n.end, 4))
+                if k not in seen:
+                    selected.append(n)
+                    seen.add(k)
+
+            remaining = [
+                n
+                for n in sorted(bucket, key=score_note, reverse=True)
+                if (n.pitch, round(n.start, 4), round(n.end, 4)) not in seen
+            ]
+            slots = max(0, max_bucket - len(selected))
+            selected.extend(remaining[:slots])
+            out.extend(selected)
+            i = j
+
+        # Final dedup by near-identical key in case adjacent windows overlap by identity.
+        uniq = {}
+        for n in out:
+            k = (n.pitch, round(n.start, 4), round(n.end, 4))
+            if k not in uniq or n.velocity > uniq[k].velocity:
+                uniq[k] = n
+        return sorted(uniq.values(), key=lambda n: (n.start, n.pitch, n.end))
+
+    left = [n for n in notes_sorted if n.pitch < split_pitch]
+    right = [n for n in notes_sorted if n.pitch >= split_pitch]
+    thinned = thin_hand(left, keep_high_anchor=False) + thin_hand(right, keep_high_anchor=True)
+    return sorted(thinned, key=lambda n: (n.start, n.pitch, n.end))
+
+
 def _restore_gap_anchors(
     arranged_notes: list,
     reference_notes: list,
@@ -825,11 +1034,12 @@ def _restore_gap_anchors(
     tempo = max(40.0, min(240.0, bpm))
     sec_per_beat = 60.0 / tempo
     if level == "simple":
-        window = sec_per_beat * 0.55
-        min_ref_presence = sec_per_beat * 0.11
-        min_added_dur = max(0.13, sec_per_beat * 0.25)
-        max_added_dur = max(0.42, sec_per_beat * 1.05)
-        step = window * 0.5
+        # Keep phrase continuity, but avoid rebuilding dense texture.
+        window = sec_per_beat * 0.75
+        min_ref_presence = sec_per_beat * 0.18
+        min_added_dur = max(0.14, sec_per_beat * 0.28)
+        max_added_dur = max(0.34, sec_per_beat * 0.7)
+        step = window
     else:
         window = sec_per_beat * 0.7
         min_ref_presence = sec_per_beat * 0.14
@@ -875,7 +1085,9 @@ def _restore_gap_anchors(
                     lh = [n for n in local_ref if n.pitch < split_pitch]
                     if rh:
                         chosen.append(max(rh, key=lambda n: (n.pitch, n.velocity, n.end - n.start)))
-                    if lh:
+                    # Only add LH anchor when there is no RH candidate, to avoid
+                    # rebuilding dense two-hand textures in easy mode.
+                    if lh and not chosen:
                         chosen.append(min(lh, key=lambda n: (n.pitch, -n.velocity)))
                 else:
                     chosen.append(
@@ -924,12 +1136,102 @@ def _restore_gap_anchors(
     return deduped
 
 
+def _enforce_max_onset_gap(
+    arranged_notes: list,
+    reference_notes: list,
+    bpm: float,
+    level: str,
+) -> list:
+    """
+    Hard continuity guard: if arranged output has large onset-to-onset holes but
+    reference has attacks in-between, inject lightweight anchors.
+    """
+    if not arranged_notes or not reference_notes:
+        return arranged_notes
+
+    tempo = max(40.0, min(240.0, bpm))
+    sec_per_beat = 60.0 / tempo
+    max_onset_gap = sec_per_beat * (1.8 if level == "simple" else 1.35)
+    min_anchor_dur = max(0.07, sec_per_beat * 0.11)
+    max_anchor_dur = max(0.26, sec_per_beat * 0.62)
+
+    arranged = sorted(arranged_notes, key=lambda n: (n.start, n.pitch, n.end))
+    ref = sorted(reference_notes, key=lambda n: (n.start, n.pitch, n.end))
+    ref = [
+        n
+        for n in ref
+        if (n.end - n.start) >= min_anchor_dur * 0.7 and n.velocity >= 12
+    ]
+    if not ref:
+        return arranged
+
+    injected = []
+    for i in range(len(arranged) - 1):
+        left = arranged[i].start
+        right = arranged[i + 1].start
+        gap = right - left
+        if gap <= max_onset_gap:
+            continue
+
+        candidates = [
+            n for n in ref
+            if (left + 0.02) < n.start < (right - 0.02)
+        ]
+        if not candidates:
+            continue
+
+        # Add at most one anchor in simple mode (keep texture sparse).
+        if level == "simple":
+            count = 1
+        else:
+            count = min(2, max(1, int(gap / max_onset_gap)))
+        for k in range(1, count + 1):
+            target = left + (gap * (k / (count + 1)))
+            chosen = min(
+                candidates,
+                key=lambda n: (
+                    abs(n.start - target),
+                    -n.velocity,
+                    -(n.end - n.start),
+                ),
+            )
+            st = float(chosen.start)
+            en = float(min(chosen.end, st + max_anchor_dur))
+            injected.append(
+                pretty_midi.Note(
+                    velocity=int(max(30, min(100, chosen.velocity))),
+                    pitch=int(chosen.pitch),
+                    start=st,
+                    end=max(st + min_anchor_dur, en),
+                )
+            )
+
+    if not injected:
+        return arranged
+
+    all_notes = sorted(arranged + injected, key=lambda n: (n.start, n.pitch, n.end))
+    deduped = []
+    for n in all_notes:
+        if (
+            deduped
+            and deduped[-1].pitch == n.pitch
+            and abs(deduped[-1].start - n.start) <= 0.016
+            and abs(deduped[-1].end - n.end) <= 0.08
+        ):
+            if n.velocity > deduped[-1].velocity:
+                deduped[-1] = n
+            continue
+        deduped.append(n)
+    return deduped
+
+
 def _enforce_playability(
     notes: list,
     chord_snap_sec: float,
     max_notes_per_chord: int,
     min_rearticulation: float,
     max_chord_span: int,
+    preserve_note_ids: set | None = None,
 ) -> list:
     """
     Constrain transcription to human-playable density.
@@ -937,6 +1239,7 @@ def _enforce_playability(
     if not notes:
         return notes
 
+    protected = preserve_note_ids or set()
     sorted_notes = sorted(notes, key=lambda n: (n.start, n.pitch, n.end))
 
     # Group near-simultaneous notes into chord buckets.
@@ -966,6 +1269,12 @@ def _enforce_playability(
 
         kept = []
         seen_ids = set()
+        locked = [n for n in bucket if id(n) in protected]
+        for n in sorted(locked, key=lambda x: (x.pitch, x.start, x.end)):
+            key = (n.pitch, round(n.start, 4), round(n.end, 4))
+            if key not in seen_ids:
+                kept.append(n)
+                seen_ids.add(key)
         for anchor in (low, high):
             key = (anchor.pitch, round(anchor.start, 4), round(anchor.end, 4))
             if key not in seen_ids:
@@ -1001,8 +1310,17 @@ def _enforce_playability(
             # Drop weaker extreme.
             left = kept[0]
             right = kept[-1]
-            drop_left = left.velocity <= right.velocity
-            if drop_left:
+            left_locked = id(left) in protected
+            right_locked = id(right) in protected
+            if left_locked and right_locked:
+                break
+            if left_locked:
+                kept = kept[:-1]
+                continue
+            if right_locked:
+                kept = kept[1:]
+                continue
+            if left.velocity <= right.velocity:
                 kept = kept[1:]
             else:
                 kept = kept[:-1]
@@ -1021,6 +1339,18 @@ def _enforce_playability(
 
         gap = n.start - prev.start
         if gap < min_rearticulation:
+            prev_locked = id(prev) in protected
+            n_locked = id(n) in protected
+            if prev_locked and not n_locked:
+                continue
+            if n_locked and not prev_locked:
+                try:
+                    thinned.remove(prev)
+                except ValueError:
+                    pass
+                thinned.append(n)
+                last_by_pitch[n.pitch] = n
+                continue
             # Keep the stronger of two near-identical strikes.
             if n.velocity > prev.velocity:
                 try:
@@ -1411,9 +1741,15 @@ def _scale_velocities(pm: pretty_midi.PrettyMIDI, level: str) -> pretty_midi.Pre
     expanded (cleaner, more expressive playback).
     """
     if level == "simple":
-        out_min, out_span, curve = 34, 68, 1.02
+        # Keep simple mode punchy and avoid near-silent tails.
+        out_min, out_span, curve = 46, 62, 0.9
+        quiet_floor = 52
+        short_note_floor = 58
     else:
-        out_min, out_span, curve = 30, 82, 0.92
+        # Balanced keeps wider dynamics, but still lifts very quiet notes.
+        out_min, out_span, curve = 40, 74, 0.8
+        quiet_floor = 46
+        short_note_floor = 52
 
     for instrument in pm.instruments:
         if not instrument.notes:
@@ -1422,10 +1758,17 @@ def _scale_velocities(pm: pretty_midi.PrettyMIDI, level: str) -> pretty_midi.Pre
         lo, hi = min(velocities), max(velocities)
         span = hi - lo if hi > lo else 1
         for note in instrument.notes:
+            dur = max(0.0, note.end - note.start)
             n = (note.velocity - lo) / span
             n = n ** curve
-            note.velocity = int(out_min + n * out_span)
-            note.velocity = max(1, min(127, note.velocity))
+            v = int(out_min + n * out_span)
+            # Hard floor for audibility in DAWs/samplers.
+            if v < quiet_floor:
+                v = quiet_floor
+            # Short notes can disappear perceptually; keep them a little louder.
+            if dur <= 0.11 and v < short_note_floor:
+                v = short_note_floor
+            note.velocity = max(1, min(127, v))
     return pm
 
 
@@ -1456,10 +1799,10 @@ def transcribe(req: TranscriptionRequest) -> TranscriptionResponse:
 
         print("[transcribe] full-mix Basic Pitch, inference_mode=", inference_mode)
 
-        raw_midi = _run_basic_pitch(
+        inferred_midi = _run_basic_pitch(
             model, input_path, level=clean_level, inference_mode=inference_mode
         )
-        merged_roles = _collapse_to_single_piano(raw_midi)
+        merged_roles = _collapse_to_single_piano(inferred_midi)
         print("[transcribe] raw notes (single piano):", _count_notes(merged_roles))
 
         # Recall-first rescue:
@@ -1492,6 +1835,33 @@ def transcribe(req: TranscriptionRequest) -> TranscriptionResponse:
                     _count_notes(merged_roles),
                 )
 
+        # Build raw export with maximal note recall and no cleanup/arrangement.
+        # We always keep a clone of the pre-clean note stream as a baseline.
+        raw_export_roles = _clone_pretty_midi(merged_roles)
+        if inference_mode != "quality":
+            try:
+                print("[transcribe] raw export recall pass: quality")
+                raw_quality = _run_basic_pitch(
+                    model,
+                    input_path,
+                    level="balanced",
+                    inference_mode="quality",
+                )
+                raw_quality_roles = _collapse_to_single_piano(raw_quality)
+                raw_export_roles = _merge_midis(
+                    raw_export_roles,
+                    raw_quality_roles,
+                    start_tol=0.045,
+                    end_tol=0.07,
+                )
+                print(
+                    "[transcribe] raw export note count (max recall):",
+                    _count_notes(raw_export_roles),
+                )
+            except Exception as e:
+                # If the extra quality pass fails, still return the baseline raw.
+                print("[transcribe] raw quality pass failed; using baseline raw:", e)
+
         bpm = _estimate_bpm(
             input_path,
             max_audio_seconds=(
@@ -1508,6 +1878,7 @@ def transcribe(req: TranscriptionRequest) -> TranscriptionResponse:
         ts_num, ts_den = _estimate_time_signature(input_path, max_audio_seconds=ts_max)
         time_signature_str = f"{ts_num}/{ts_den}"
 
+        raw_midi = _clone_pretty_midi(raw_export_roles)
         cleaned_midi = _clean_midi(merged_roles, clean_level, bpm=bpm)
         # Use a less-thinned reference for continuity recovery. If we use already
         # cleaned notes here, some real connector activity is gone before we can
@@ -1530,9 +1901,21 @@ def transcribe(req: TranscriptionRequest) -> TranscriptionResponse:
                 bpm=bpm,
                 level=clean_level,
             )
+            inst.notes = _enforce_max_onset_gap(
+                inst.notes,
+                ref_notes,
+                bpm=bpm,
+                level=clean_level,
+            )
             if inst.notes:
                 inst.notes = _consolidate_sustains(inst.notes, merge_gap=gap2, min_overlap=0.0)
                 inst.notes = _bridge_phrase_gaps(inst.notes, level=clean_level, bpm=bpm)
+                inst.notes = _limit_local_onset_bursts(
+                    inst.notes,
+                    bpm=bpm,
+                    level=clean_level,
+                    split_pitch=60,
+                )
         cleaned_midi = _scale_velocities(cleaned_midi, clean_level)
         print(
             "[transcribe] arranged piano notes:",
@@ -1564,15 +1947,19 @@ def transcribe(req: TranscriptionRequest) -> TranscriptionResponse:
         midi_id = uuid.uuid4().hex
         midi_path = MEDIA_ROOT / f"{midi_id}.mid"
         cleaned_midi.write(str(midi_path))
+        raw_midi_path = MEDIA_ROOT / f"{midi_id}-raw.mid"
+        raw_midi.write(str(raw_midi_path))
 
         base_url = os.environ.get("TRANSCRIBER_PUBLIC_BASE_URL")
         if not base_url:
             base_url = "http://localhost:8000"
 
         midi_url = f"{base_url.rstrip('/')}/media/{midi_path.name}"
+        raw_midi_url = f"{base_url.rstrip('/')}/media/{raw_midi_path.name}"
 
         return TranscriptionResponse(
             midi_url=midi_url,
+            raw_midi_url=raw_midi_url,
             pdf_url=None,
             time_signature=time_signature_str,
         )

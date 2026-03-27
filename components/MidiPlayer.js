@@ -5,22 +5,6 @@ import * as Tone from "tone";
 import { Midi } from "@tonejs/midi";
 import StaffNotation from "./StaffNotation";
 
-const DEFAULT_PLAYHEAD_LAG_SEC = 0.1;
-
-function estimatePlayheadLagSec() {
-  try {
-    const toneCtx = Tone.getContext?.();
-    const ac = toneCtx?.rawContext || toneCtx?.context || null;
-    const lookAhead = Number(toneCtx?.lookAhead) || 0;
-    const baseLatency = ac && Number.isFinite(ac.baseLatency) ? ac.baseLatency : 0;
-    const outputLatency = ac && Number.isFinite(ac.outputLatency) ? ac.outputLatency : 0;
-    // Tiny cushion for sampler attack/decoder jitter.
-    return Math.max(0.02, Math.min(0.25, lookAhead + baseLatency + outputLatency + 0.01));
-  } catch {
-    return DEFAULT_PLAYHEAD_LAG_SEC;
-  }
-}
-
 function dedupeNearSimultaneousSamePitch(noteList, timeTolSec = 0.001) {
   if (!Array.isArray(noteList) || noteList.length === 0) return [];
   const sorted = [...noteList].sort((a, b) => {
@@ -133,7 +117,9 @@ function sanitizePlayableNotesForStaffAndAudio(
     }
 
     for (const [, measureNotes] of byMeasure) {
-      const sorted = [...measureNotes].sort((a, b) => a.localTime - b.localTime);
+      const sorted = [...measureNotes].sort(
+        (a, b) => a.localTime - b.localTime,
+      );
       let beatsUsed = 0;
       let i = 0;
       while (i < sorted.length && beatsUsed < beatsPerMeasure) {
@@ -141,7 +127,10 @@ function sanitizePlayableNotesForStaffAndAudio(
         const chord = sorted.filter(
           (n) => n.localTime >= t - chordEps && n.localTime <= t + chordEps,
         );
-        const dur = chord.reduce((s, n) => Math.max(s, Number(n.duration) || 0), 0);
+        const dur = chord.reduce(
+          (s, n) => Math.max(s, Number(n.duration) || 0),
+          0,
+        );
         const beatsRemaining = Math.max(0, beatsPerMeasure - beatsUsed);
         if (beatsRemaining <= 1e-6) {
           i += chord.length;
@@ -199,7 +188,7 @@ function smoothDurationsForPlayback(noteList, secPerBeat) {
     for (let j = i + 1; j < out.length; j += 1) {
       const c = out[j];
       const cMidi = Number(c.midi) || 0;
-      if ((cMidi >= 60) === thisIsRight) {
+      if (cMidi >= 60 === thisIsRight) {
         next = c;
         break;
       }
@@ -239,8 +228,39 @@ function flattenNotes(midi) {
     firstTime > 0
       ? notes.map((n) => ({ ...n, time: Math.max(0, n.time - firstTime) }))
       : notes;
-  // Keep the same dedupe policy as staff rendering so audio and notation align.
-  return dedupeNearSimultaneousSamePitch(shifted);
+  return shifted;
+}
+
+function buildOnsetTimeline(noteList, timeTolSec = 0.001) {
+  if (!Array.isArray(noteList) || noteList.length === 0) return [];
+  const sortedTimes = noteList
+    .map((n) => Math.max(0, Number(n?.time) || 0))
+    .filter((t) => Number.isFinite(t))
+    .sort((a, b) => a - b);
+  const out = [];
+  for (const t of sortedTimes) {
+    const prev = out[out.length - 1];
+    if (prev != null && Math.abs(t - prev) <= timeTolSec) continue;
+    out.push(t);
+  }
+  return out;
+}
+
+function snapToLatestOnset(onsets, timeSec, timeTolSec = 0.001) {
+  const t = Math.max(0, Number(timeSec) || 0);
+  if (!Array.isArray(onsets) || onsets.length === 0) return t;
+  if (t <= onsets[0] + timeTolSec) return onsets[0];
+  const last = onsets[onsets.length - 1];
+  if (t >= last) return last;
+
+  let lo = 0;
+  let hi = onsets.length - 1;
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (onsets[mid] <= t + timeTolSec) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return onsets[Math.max(0, hi)] ?? t;
 }
 
 function timeSignatureFromMidi(midi) {
@@ -258,7 +278,6 @@ function timeSignatureFromMidi(midi) {
   return null;
 }
 
-
 const FIFTHS_TO_MAJOR = {
   "-7": "Cb",
   "-6": "Gb",
@@ -267,14 +286,14 @@ const FIFTHS_TO_MAJOR = {
   "-3": "Eb",
   "-2": "Bb",
   "-1": "F",
-  "0": "C",
-  "1": "G",
-  "2": "D",
-  "3": "A",
-  "4": "E",
-  "5": "B",
-  "6": "F#",
-  "7": "C#",
+  0: "C",
+  1: "G",
+  2: "D",
+  3: "A",
+  4: "E",
+  5: "B",
+  6: "F#",
+  7: "C#",
 };
 
 const FIFTHS_TO_MINOR = {
@@ -285,21 +304,47 @@ const FIFTHS_TO_MINOR = {
   "-3": "Cm",
   "-2": "Gm",
   "-1": "Dm",
-  "0": "Am",
-  "1": "Em",
-  "2": "Bm",
-  "3": "F#m",
-  "4": "C#m",
-  "5": "G#m",
-  "6": "D#m",
-  "7": "A#m",
+  0: "Am",
+  1: "Em",
+  2: "Bm",
+  3: "F#m",
+  4: "C#m",
+  5: "G#m",
+  6: "D#m",
+  7: "A#m",
 };
 
 const COMMON_VEX_KEYS = new Set([
-  "C", "G", "D", "A", "E", "B", "F#", "C#",
-  "F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb",
-  "Am", "Em", "Bm", "F#m", "C#m", "G#m", "D#m", "A#m",
-  "Dm", "Gm", "Cm", "Fm", "Bbm", "Ebm", "Abm",
+  "C",
+  "G",
+  "D",
+  "A",
+  "E",
+  "B",
+  "F#",
+  "C#",
+  "F",
+  "Bb",
+  "Eb",
+  "Ab",
+  "Db",
+  "Gb",
+  "Cb",
+  "Am",
+  "Em",
+  "Bm",
+  "F#m",
+  "C#m",
+  "G#m",
+  "D#m",
+  "A#m",
+  "Dm",
+  "Gm",
+  "Cm",
+  "Fm",
+  "Bbm",
+  "Ebm",
+  "Abm",
 ]);
 
 function normalizeKeyNameForVexFlow(raw) {
@@ -426,16 +471,17 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
   const [keySignature, setKeySignature] = useState("C");
   const [secondsPerBeat, setSecondsPerBeat] = useState(0.5);
   const [currentTime, setCurrentTime] = useState(0);
+  const [playheadTime, setPlayheadTime] = useState(0);
   const [totalDuration, setTotalDuration] = useState(0);
   const startOffsetRef = useRef(0);
   const playTimeoutRef = useRef(null);
   const lastUrlRef = useRef(null);
   const rafRef = useRef(null);
-  const playheadLagRef = useRef(DEFAULT_PLAYHEAD_LAG_SEC);
   const midiRef = useRef(null);
   const samplerRef = useRef(null);
   const partRef = useRef(null);
   const playbackNotesRef = useRef([]);
+  const onsetTimesRef = useRef([]);
   const noteStartRef = useRef(0);
   const noteEndRef = useRef(0);
 
@@ -472,7 +518,17 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
 
         const flatNotes = flattenNotes(midi);
         noteStartRef.current =
-          flatNotes.length > 0 ? Math.max(0, midi.tracks.flatMap((t) => t.notes).reduce((m, n) => Math.min(m, n.time), Number.POSITIVE_INFINITY)) : 0;
+          flatNotes.length > 0
+            ? Math.max(
+                0,
+                midi.tracks
+                  .flatMap((t) => t.notes)
+                  .reduce(
+                    (m, n) => Math.min(m, n.time),
+                    Number.POSITIVE_INFINITY,
+                  ),
+              )
+            : 0;
 
         const fromMidi = timeSignatureFromMidi(midi);
         const resolvedTimeSignature =
@@ -486,21 +542,19 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
         const resolvedSecondsPerBeat =
           Number.isFinite(bpmMeta) && bpmMeta > 0 ? 60 / bpmMeta : 0.5;
         setSecondsPerBeat(resolvedSecondsPerBeat);
-        const playbackNotes = smoothDurationsForPlayback(
+        // Use one shared note set for notation + playback so what users hear
+        // and what they see stay aligned.
+        const unifiedNotes = smoothDurationsForPlayback(
           flatNotes,
           resolvedSecondsPerBeat,
         );
-        const staffNotes = sanitizePlayableNotesForStaffAndAudio(
-          flatNotes,
-          resolvedSecondsPerBeat,
-          resolvedTimeSignature,
-        );
-        setNotes(staffNotes);
-        playbackNotesRef.current = playbackNotes;
+        setNotes(unifiedNotes);
+        playbackNotesRef.current = unifiedNotes;
+        onsetTimesRef.current = buildOnsetTimeline(unifiedNotes);
 
         const fullDurationInit =
-          playbackNotes.length > 0
-            ? playbackNotes.reduce(
+          unifiedNotes.length > 0
+            ? unifiedNotes.reduce(
                 (max, n) => Math.max(max, n.time + (n.duration || 0)),
                 0,
               )
@@ -510,8 +564,8 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
         // Helpful for debugging end-to-end timing vs staff rendering
         // but safe in production as a low-frequency log.
         console.log("MidiPlayer loaded MIDI", {
-          noteCount: playbackNotes.length,
-          firstTime: playbackNotes[0]?.time ?? 0,
+          noteCount: unifiedNotes.length,
+          firstTime: unifiedNotes[0]?.time ?? 0,
           lastEndTime: fullDurationInit,
         });
       } catch (err) {
@@ -530,16 +584,12 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url, timeSignatureProp]);
 
-  // Update currentTime during playback based on Transport + measured output lag.
+  // Update currentTime during playback directly from the playback transport.
   useEffect(() => {
     if (!isPlaying || totalDuration <= 0) return;
-    // Drive UI time from Tone.Transport which is synced to the audio context.
-    // In practice the audible sampler attack lags Transport, so keep the
-    // playhead behind to match what users actually hear.
     const tick = () => {
       const transport = Tone.getTransport();
-      const lag = playheadLagRef.current ?? DEFAULT_PLAYHEAD_LAG_SEC;
-      const t = (startOffsetRef.current ?? 0) + (transport.seconds ?? 0) - lag;
+      const t = (startOffsetRef.current ?? 0) + (transport.seconds ?? 0);
       const clamped = Math.max(0, Math.min(totalDuration, t));
       setCurrentTime(clamped);
       rafRef.current = requestAnimationFrame(tick);
@@ -584,23 +634,29 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
           const fallbackSecondsPerBeat =
             Number.isFinite(bpmMeta) && bpmMeta > 0 ? 60 / bpmMeta : 0.5;
           setSecondsPerBeat(fallbackSecondsPerBeat);
-          const playbackNotes = smoothDurationsForPlayback(
+          const unifiedNotes = smoothDurationsForPlayback(
             flatNotes,
             fallbackSecondsPerBeat,
           );
-          const staffNotes = sanitizePlayableNotesForStaffAndAudio(
-            flatNotes,
-            fallbackSecondsPerBeat,
-            fallbackTimeSignature,
-          );
-          setNotes(staffNotes);
-          playbackNotesRef.current = playbackNotes;
+          setNotes(unifiedNotes);
+          playbackNotesRef.current = unifiedNotes;
+          onsetTimesRef.current = buildOnsetTimeline(unifiedNotes);
           noteStartRef.current =
-            flatNotes.length > 0 ? Math.max(0, midi.tracks.flatMap((t) => t.notes).reduce((m, n) => Math.min(m, n.time), Number.POSITIVE_INFINITY)) : 0;
+            flatNotes.length > 0
+              ? Math.max(
+                  0,
+                  midi.tracks
+                    .flatMap((t) => t.notes)
+                    .reduce(
+                      (m, n) => Math.min(m, n.time),
+                      Number.POSITIVE_INFINITY,
+                    ),
+                )
+              : 0;
 
           const fullDurationInit =
-            playbackNotes.length > 0
-              ? playbackNotes.reduce(
+            unifiedNotes.length > 0
+              ? unifiedNotes.reduce(
                   (max, n) => Math.max(max, n.time + (n.duration || 0)),
                   0,
                 )
@@ -623,8 +679,8 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
         0,
         Math.min(offsetSeconds || 0, fullDuration || 0),
       );
-      playheadLagRef.current = estimatePlayheadLagSec();
-      setCurrentTime(Math.max(0, startOffset - playheadLagRef.current));
+      setCurrentTime(Math.max(0, startOffset));
+      setPlayheadTime(snapToLatestOnset(onsetTimesRef.current, startOffset));
       startOffsetRef.current = startOffset;
 
       // Stop any existing playback
@@ -698,6 +754,7 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
           {
             name: note.name,
             duration: normDur,
+            songTime: normTime,
           },
         ]);
       });
@@ -705,6 +762,18 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
       const part = new Tone.Part((time, note) => {
         const duration = Math.min(Math.max(note.duration, 0.02), 8);
         sampler.triggerAttackRelease(note.name, duration, time);
+        // Drive playhead from Tone's audio clock so jumps happen at heard onsets.
+        Tone.Draw.schedule(() => {
+          const clampedSongTime = Math.max(
+            0,
+            Math.min(fullDuration, Number(note.songTime) || 0),
+          );
+          const snapped = snapToLatestOnset(
+            onsetTimesRef.current,
+            clampedSongTime,
+          );
+          setPlayheadTime(snapped);
+        }, time);
       }, events);
       part.start(0);
       part.stop(fullDuration + 0.5);
@@ -724,7 +793,8 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
         sampler.releaseAll?.();
         setIsPlaying(false);
         setIsPaused(false);
-        setCurrentTime(Math.max(0, fullDuration - (playheadLagRef.current || DEFAULT_PLAYHEAD_LAG_SEC)));
+        setCurrentTime(Math.max(0, fullDuration));
+        setPlayheadTime(snapToLatestOnset(onsetTimesRef.current, fullDuration));
         playTimeoutRef.current = null;
         startOffsetRef.current = 0;
       }, totalDurationSeconds);
@@ -748,7 +818,8 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
       Math.min(totalDuration, (startOffsetRef.current ?? 0) + elapsed),
     );
 
-    setCurrentTime(Math.max(0, pausedAt - (playheadLagRef.current || DEFAULT_PLAYHEAD_LAG_SEC)));
+    setCurrentTime(Math.max(0, pausedAt));
+    setPlayheadTime(snapToLatestOnset(onsetTimesRef.current, pausedAt));
     startOffsetRef.current = pausedAt;
 
     if (playTimeoutRef.current) {
@@ -822,6 +893,7 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
                 onChange={(event) => {
                   const time = parseFloat(event.target.value) || 0;
                   setCurrentTime(time);
+                  setPlayheadTime(time);
                   if (isPlaying) {
                     playFrom(time);
                   }
@@ -832,12 +904,13 @@ export default function MidiPlayer({ url, timeSignature: timeSignatureProp }) {
           </div>
           <StaffNotation
             notes={notes}
-            currentTime={currentTime}
+            currentTime={playheadTime}
             timeSignature={timeSignature}
             keySignature={keySignature}
             secondsPerBeat={secondsPerBeat}
             onSeek={(time) => {
               setCurrentTime(time);
+              setPlayheadTime(time);
               if (isPlaying) {
                 playFrom(time);
               }

@@ -304,7 +304,17 @@ export default function Home() {
                             rel="noopener noreferrer"
                             className="inline-flex items-center justify-center rounded-full border border-neutral-400 bg-white px-3 py-1.5 text-xs font-medium text-neutral-900 transition hover:border-neutral-950 hover:bg-neutral-100"
                           >
-                            Download MIDI
+                            Download Cleaned MIDI
+                          </a>
+                        )}
+                        {result.rawMidiUrl && (
+                          <a
+                            href={result.rawMidiUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center justify-center rounded-full border border-neutral-400 bg-white px-3 py-1.5 text-xs font-medium text-neutral-900 transition hover:border-neutral-950 hover:bg-neutral-100"
+                          >
+                            Download Raw MIDI
                           </a>
                         )}
                       </div>

@@ -11,6 +11,8 @@ const DEFAULT_SECONDS_PER_BEAT = 0.5; // 120 BPM fallback
 const TREBLE_REST_CENTER_PITCH = "B4";
 const BASS_REST_CENTER_PITCH = "D3";
 const PLAYHEAD_X_BIAS_PX = 6;
+const STAFF_SPACE_PX = 10;
+const GRAND_STAFF_SYSTEM_GAP_PX = 24;
 
 /**
  * MIDI from multiple tracks often repeats the same pitch at (almost) the same time.
@@ -58,15 +60,25 @@ function uniqNoteNamesPreserveOrder(names) {
 
 function durationToCode(sec, secPerBeat = DEFAULT_SECONDS_PER_BEAT) {
   const beats = sec / secPerBeat;
+  if (beats <= 0.03125) return "128";
+  if (beats <= 0.0625) return "64";
+  if (beats <= 0.125) return "32";
   if (beats <= 0.25) return "16";
   if (beats <= 0.5) return "8";
   if (beats <= 1) return "q";
   if (beats <= 2) return "h";
-  return "w";
+  // Keep rendered notes stemmed; avoid whole-note glyphs for long sustains.
+  return "h";
 }
 
 function codeToBeats(code) {
   switch (code) {
+    case "128":
+      return 0.03125;
+    case "64":
+      return 0.0625;
+    case "32":
+      return 0.125;
     case "16":
       return 0.25;
     case "8":
@@ -130,11 +142,13 @@ function buildEasyScoreMeasure(
 ) {
   function fitDurationCode(sec, beatsRemaining) {
     const candidates = [
-      ["w", 4],
       ["h", 2],
       ["q", 1],
       ["8", 0.5],
       ["16", 0.25],
+      ["32", 0.125],
+      ["64", 0.0625],
+      ["128", 0.03125],
     ];
     const target = codeToBeats(durationToCode(sec, secPerBeat));
     // choose closest duration <= remaining beats
@@ -144,17 +158,19 @@ function buildEasyScoreMeasure(
       const score = Math.abs(beats - target);
       if (!best || score < best.score) best = { code, beats, score };
     }
-    return best ?? { code: "16", beats: Math.min(0.25, beatsRemaining) };
+    return best ?? null;
   }
 
   const tiePairs = [];
   const slurPairs = [];
+  const events = [];
 
   if (!notes.length) {
     return {
       str: padWithRests("", 0, maxBeats, restPitch),
       tiePairs,
       slurPairs,
+      events,
     };
   }
 
@@ -166,20 +182,40 @@ function buildEasyScoreMeasure(
   let beatsUsed = 0;
 
   let i = 0;
-  while (i < sorted.length && beatsUsed < maxBeats) {
+  while (i < sorted.length) {
     const t = sorted[i].time;
     const chord = sorted.filter(
       (n) => n.time >= t - chordEps && n.time <= t + chordEps,
     );
-    const dur = chord.reduce((s, n) => Math.max(s, n.duration), 0);
+    const chordEnd = chord.reduce(
+      (s, n) => Math.max(s, n.time + n.duration),
+      0,
+    );
+    const nextIndex = i + chord.length;
+    const nextChordTime =
+      nextIndex < sorted.length
+        ? sorted[nextIndex].time
+        : maxBeats * secPerBeat;
+    // Use onset spacing first so we preserve rhythmic placement from MIDI even
+    // when original note durations overlap heavily.
+    const onsetSpan = Math.max(0, nextChordTime - t);
+    const maxDurFromMidi = Math.max(0, chordEnd - t);
+    const dur = Math.max(
+      0.01,
+      Math.min(
+        Math.max(onsetSpan, secPerBeat / 128),
+        maxDurFromMidi > 0 ? maxDurFromMidi : onsetSpan || secPerBeat / 128,
+      ),
+    );
     const beatsRemaining = Math.max(0, maxBeats - beatsUsed);
     if (beatsRemaining <= 1e-6) {
-      i += chord.length;
-      continue;
+      break;
     }
     const fit = fitDurationCode(dur, beatsRemaining);
+    if (!fit) break;
     const code = fit.code;
     const noteBeats = fit.beats;
+    const beatStart = beatsUsed;
     const names = uniqNoteNamesPreserveOrder(
       chord
         .map((n) => midiToNoteName(n.midi) ?? sanitizeNoteName(n.name))
@@ -206,6 +242,25 @@ function buildEasyScoreMeasure(
       tEnd: t + dur,
       singleMidi,
       isChord: names.length > 1,
+    });
+    events.push({
+      timeSec: chord.reduce(
+        (minTime, n) =>
+          Math.min(
+            minTime,
+            Number.isFinite(n.sourceTime) ? n.sourceTime : Number(n.time) || 0,
+          ),
+        Number.POSITIVE_INFINITY,
+      ),
+      beatStart,
+      beatLength: noteBeats,
+      timeEndSec: chord.reduce((maxEnd, n) => {
+        const t = Number.isFinite(n.sourceTime)
+          ? n.sourceTime
+          : Number(n.time) || 0;
+        const d = Math.max(0.02, Number(n.duration) || 0.02);
+        return Math.max(maxEnd, t + d);
+      }, 0),
     });
 
     beatsUsed += noteBeats;
@@ -245,7 +300,94 @@ function buildEasyScoreMeasure(
     str: padWithRests(str, beatsUsed, maxBeats, restPitch),
     tiePairs,
     slurPairs,
+    events,
   };
+}
+
+function dedupeAndMonotonizeTimingMap(points) {
+  if (!Array.isArray(points) || points.length === 0) return [];
+  const sorted = [...points].sort((a, b) => {
+    const dt = (a.timeSec || 0) - (b.timeSec || 0);
+    if (Math.abs(dt) > 1e-6) return dt;
+    return (a.beat || 0) - (b.beat || 0);
+  });
+  const timeTolSec = 0.001;
+  const buckets = [];
+  for (let i = 0; i < sorted.length; ) {
+    const seed = sorted[i];
+    if (!Number.isFinite(seed?.timeSec) || !Number.isFinite(seed?.beat)) {
+      i += 1;
+      continue;
+    }
+    const beats = [seed.beat];
+    let j = i + 1;
+    while (j < sorted.length) {
+      const p = sorted[j];
+      if (!Number.isFinite(p?.timeSec) || !Number.isFinite(p?.beat)) {
+        j += 1;
+        continue;
+      }
+      if (Math.abs(p.timeSec - seed.timeSec) > timeTolSec) break;
+      beats.push(p.beat);
+      j += 1;
+    }
+    beats.sort((a, b) => a - b);
+    const mid = Math.floor(beats.length / 2);
+    const medianBeat =
+      beats.length % 2 === 1 ? beats[mid] : (beats[mid - 1] + beats[mid]) / 2;
+    buckets.push({ timeSec: seed.timeSec, beat: medianBeat });
+    i = j;
+  }
+
+  const out = [];
+  for (const p of buckets) {
+    const prev = out[out.length - 1];
+    if (prev && Math.abs(p.timeSec - prev.timeSec) <= timeTolSec) {
+      prev.beat = (prev.beat + p.beat) / 2;
+    } else {
+      out.push({ timeSec: p.timeSec, beat: p.beat });
+    }
+  }
+  for (let i = 1; i < out.length; i += 1) {
+    if (out[i].beat < out[i - 1].beat) out[i].beat = out[i - 1].beat;
+  }
+  return out;
+}
+
+function mapTimeToBeat(timingMap, timeSec, fallbackBeat = 0) {
+  if (!Array.isArray(timingMap) || timingMap.length === 0) return fallbackBeat;
+  if (timingMap.length === 1) return timingMap[0].beat;
+
+  if (timeSec <= timingMap[0].timeSec) return timingMap[0].beat;
+  const last = timingMap[timingMap.length - 1];
+  if (timeSec >= last.timeSec) return last.beat;
+  for (let i = 0; i < timingMap.length - 1; i += 1) {
+    const a = timingMap[i];
+    const b = timingMap[i + 1];
+    if (timeSec < a.timeSec || timeSec > b.timeSec) continue;
+    const span = Math.max(1e-6, b.timeSec - a.timeSec);
+    const p = (timeSec - a.timeSec) / span;
+    return a.beat + p * (b.beat - a.beat);
+  }
+  return fallbackBeat;
+}
+
+function mapBeatToTime(timingMap, beat, fallbackTimeSec = 0) {
+  if (!Array.isArray(timingMap) || timingMap.length === 0)
+    return fallbackTimeSec;
+  if (timingMap.length === 1) return timingMap[0].timeSec;
+  if (beat <= timingMap[0].beat) return timingMap[0].timeSec;
+  const last = timingMap[timingMap.length - 1];
+  if (beat >= last.beat) return last.timeSec;
+  for (let i = 0; i < timingMap.length - 1; i += 1) {
+    const a = timingMap[i];
+    const b = timingMap[i + 1];
+    if (beat < a.beat || beat > b.beat) continue;
+    const span = Math.max(1e-6, b.beat - a.beat);
+    const p = (beat - a.beat) / span;
+    return a.timeSec + p * (b.timeSec - a.timeSec);
+  }
+  return fallbackTimeSec;
 }
 
 function applyTiesAndSlurs(factory, tickables, tiePairs, slurPairs) {
@@ -313,21 +455,35 @@ function padWithRests(
   const remaining = maxBeats - beatsUsed;
   if (remaining <= 0.00001) return str;
 
-  // Quantize remaining rests to 16th-grid to avoid float drift.
-  const steps16 = Math.max(0, Math.round(remaining / 0.25));
+  // Quantize remaining rests to 128th-grid so dense measures can still
+  // be filled without overflowing ticks.
+  const STEP = 0.03125; // 1/128 note in beat units
+  const steps128 = Math.max(0, Math.round(remaining / STEP));
   const restParts = [];
-  // Group into quarter/eighth/sixteenth to keep token count low.
-  let s = steps16;
-  while (s >= 4) {
+  // Group into quarter/eighth/sixteenth/thirty-second/sixty-fourth/128th.
+  let s = steps128;
+  while (s >= 32) {
     restParts.push(`${restPitch}/q/r`);
+    s -= 32;
+  }
+  while (s >= 16) {
+    restParts.push(`${restPitch}/8/r`);
+    s -= 16;
+  }
+  while (s >= 8) {
+    restParts.push(`${restPitch}/16/r`);
+    s -= 8;
+  }
+  while (s >= 4) {
+    restParts.push(`${restPitch}/32/r`);
     s -= 4;
   }
   while (s >= 2) {
-    restParts.push(`${restPitch}/8/r`);
+    restParts.push(`${restPitch}/64/r`);
     s -= 2;
   }
   while (s >= 1) {
-    restParts.push(`${restPitch}/16/r`);
+    restParts.push(`${restPitch}/128/r`);
     s -= 1;
   }
 
@@ -343,7 +499,7 @@ function padWithRests(
 function beamConsecutiveTickables(score, tickables) {
   if (!score || !Array.isArray(tickables) || tickables.length < 2) return;
 
-  const BEAMABLE_DURATIONS = new Set(["8", "16", "32", "64"]);
+  const BEAMABLE_DURATIONS = new Set(["8", "16", "32", "64", "128"]);
 
   function isBeamableNote(note) {
     if (!note || typeof note.getDuration !== "function") return false;
@@ -377,6 +533,41 @@ function beamConsecutiveTickables(score, tickables) {
   flush();
 }
 
+function forceStemDirection(tickables, stemDirection = "up") {
+  if (!Array.isArray(tickables) || tickables.length === 0) return;
+  const dir = stemDirection === "down" ? -1 : 1;
+  for (const note of tickables) {
+    if (!note || typeof note.isRest !== "function" || note.isRest()) continue;
+    try {
+      if (typeof note.setStemDirection === "function") {
+        note.setStemDirection(dir);
+      }
+      if (typeof note.getStem === "function" && note.getStem()) {
+        note.getStem().setDirection?.(dir);
+      }
+    } catch (e) {
+      console.warn("StaffNotation: forcing stem direction failed", e);
+    }
+  }
+}
+
+function forceMeasureBarlines(vf, stave, measureIndex, isLastMeasureInRow) {
+  if (!stave || !vf) return;
+  try {
+    const barType = vf.Barline?.type;
+    if (!barType) return;
+    const beginType =
+      measureIndex === 0 ? barType.SINGLE : (barType.NONE ?? barType.SINGLE);
+    const endType = isLastMeasureInRow
+      ? (barType.END ?? barType.SINGLE)
+      : barType.SINGLE;
+    stave.setBegBarType?.(beginType);
+    stave.setEndBarType?.(endType);
+  } catch (e) {
+    console.warn("StaffNotation: forcing barlines failed", e);
+  }
+}
+
 /**
  * VexFlow registers Bravura/Academico via FontFace when the module loads, but loading
  * is async. Canvas uses fillText for SMuFL noteheads — if we draw before the font is
@@ -398,10 +589,36 @@ async function ensureVexflowFontsReady() {
 }
 
 const SUPPORTED_KEY_SIGNATURES = new Set([
-  "C", "G", "D", "A", "E", "B", "F#", "C#",
-  "F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb",
-  "Am", "Em", "Bm", "F#m", "C#m", "G#m", "D#m", "A#m",
-  "Dm", "Gm", "Cm", "Fm", "Bbm", "Ebm", "Abm",
+  "C",
+  "G",
+  "D",
+  "A",
+  "E",
+  "B",
+  "F#",
+  "C#",
+  "F",
+  "Bb",
+  "Eb",
+  "Ab",
+  "Db",
+  "Gb",
+  "Cb",
+  "Am",
+  "Em",
+  "Bm",
+  "F#m",
+  "C#m",
+  "G#m",
+  "D#m",
+  "A#m",
+  "Dm",
+  "Gm",
+  "Cm",
+  "Fm",
+  "Bbm",
+  "Ebm",
+  "Abm",
 ]);
 
 function normalizeKeySignature(keySignature) {
@@ -418,16 +635,11 @@ function parseTimeSignature(ts) {
   const m = String(ts ?? "4/4")
     .trim()
     .match(/^(\d+)\s*\/\s*(\d+)$/);
-  const num = m
-    ? Math.max(1, Math.min(16, parseInt(m[1], 10)))
-    : 4;
-  const den = m
-    ? Math.max(1, Math.min(32, parseInt(m[2], 10)))
-    : 4;
+  const num = m ? Math.max(1, Math.min(16, parseInt(m[1], 10))) : 4;
+  const den = m ? Math.max(1, Math.min(32, parseInt(m[2], 10))) : 4;
   const label = `${num}/${den}`;
   // Grand staff layout: quarter-note beats per measure (VexFlow EasyScore).
-  const beatsPerMeasure =
-    den === 4 || den === 2 ? num : 4;
+  const beatsPerMeasure = den === 4 || den === 2 ? num : 4;
   const beatsPerLine = beatsPerMeasure * 2;
   return { beatsPerMeasure, beatsPerLine, label };
 }
@@ -454,11 +666,13 @@ export default function StaffNotation({
   const measureGapRef = useRef(0);
   const beatsPerMeasureRef = useRef(4);
   const firstMeasureLeftPadRef = useRef(56);
+  const timingMapRef = useRef([]);
   const onSeekRef = useRef(onSeek);
   const id = useId().replace(/:/g, "");
-  const secPerBeat = Number.isFinite(secondsPerBeat) && secondsPerBeat > 0
-    ? secondsPerBeat
-    : DEFAULT_SECONDS_PER_BEAT;
+  const secPerBeat =
+    Number.isFinite(secondsPerBeat) && secondsPerBeat > 0
+      ? secondsPerBeat
+      : DEFAULT_SECONDS_PER_BEAT;
   const normalizedKeySignature = normalizeKeySignature(keySignature);
   // Each "line system" contains two 4/4 measures (8 beats total), because we
   // generate `measure1` + `measure2` tickables into a single voice.
@@ -487,19 +701,23 @@ export default function StaffNotation({
     const totalBeats = Math.max(beatsPerLine, lastEventTime / secPerBeat);
     const firstBeat = Math.max(0, firstEventTime / secPerBeat);
     const lastBeat = Math.max(firstBeat, lastEventTime / secPerBeat);
+    const timingMap = timingMapRef.current || [];
 
     const width = staffWidthRef.current;
     const playhead = playheadRef.current;
     const lineHeight = lineHeightRef.current || 0;
     const lineCount =
-      lineCountRef.current ||
-      Math.max(1, Math.ceil(totalBeats / beatsPerLine));
+      lineCountRef.current || Math.max(1, Math.ceil(totalBeats / beatsPerLine));
     if (!width || !playhead || !lineHeight || !lineCount) return;
 
-    const clampedTime = Math.max(firstEventTime, Math.min(currentTime, lastEventTime));
-    const spanTime = Math.max(1e-6, lastEventTime - firstEventTime);
-    const progress = (clampedTime - firstEventTime) / spanTime;
-    const positionBeats = firstBeat + progress * (lastBeat - firstBeat);
+    const clampedTime = Math.max(
+      firstEventTime,
+      Math.min(currentTime, lastEventTime),
+    );
+    const positionBeats =
+      timingMap.length >= 2
+        ? mapTimeToBeat(timingMap, clampedTime, clampedTime / secPerBeat)
+        : clampedTime / secPerBeat;
     const maxLines = Math.max(
       1,
       Math.min(lineCount, Math.ceil(totalBeats / beatsPerLine)),
@@ -538,7 +756,7 @@ export default function StaffNotation({
     }
     left = Math.max(
       systemX,
-      Math.min(systemX + (measureWidth * 2) + measureGap, left),
+      Math.min(systemX + measureWidth * 2 + measureGap, left),
     );
     left += PLAYHEAD_X_BIAS_PX;
     const top = lineIndex * lineHeight;
@@ -552,10 +770,13 @@ export default function StaffNotation({
     const container = containerRef.current;
     if (!notes.length || !container) return;
 
-    const { beatsPerMeasure, beatsPerLine, label: meterLabel } =
-      parseTimeSignature(timeSignature);
+    const {
+      beatsPerMeasure,
+      beatsPerLine,
+      label: meterLabel,
+    } = parseTimeSignature(timeSignature);
 
-    const displayNotes = dedupeNearSimultaneousSamePitch(notes);
+    const displayNotes = notes;
 
     const firstEventTime = Math.max(
       0,
@@ -583,7 +804,7 @@ export default function StaffNotation({
         const lineNotes = sourceNotes
           .map((n) => {
             const beat = n.time / secPerBeat;
-            return { ...n, beat };
+            return { ...n, beat, sourceTime: n.time };
           })
           .filter((n) => n.beat >= startBeat && n.beat < endBeat)
           .map((n) => ({
@@ -616,11 +837,58 @@ export default function StaffNotation({
       return result;
     };
 
-    const trebleLines = buildLines(
-      trebleNotes,
-      TREBLE_REST_CENTER_PITCH,
-    );
+    const trebleLines = buildLines(trebleNotes, TREBLE_REST_CENTER_PITCH);
     const bassLines = buildLines(bassNotes, BASS_REST_CENTER_PITCH);
+
+    const allTimingPoints = [];
+    for (let line = 0; line < lines; line += 1) {
+      const lineStartBeat = line * beatsPerLine;
+      const [trebleM1, trebleM2] = trebleLines[line] ?? [];
+      const [bassM1, bassM2] = bassLines[line] ?? [];
+      const measureDefs = [
+        { offset: 0, treble: trebleM1, bass: bassM1 },
+        { offset: beatsPerMeasure, treble: trebleM2, bass: bassM2 },
+      ];
+      for (const measure of measureDefs) {
+        const eventSources = [measure.treble?.events, measure.bass?.events];
+        for (const src of eventSources) {
+          if (!Array.isArray(src)) continue;
+          for (const ev of src) {
+            if (
+              !Number.isFinite(ev?.timeSec) ||
+              !Number.isFinite(ev?.beatStart)
+            ) {
+              continue;
+            }
+            allTimingPoints.push({
+              timeSec: ev.timeSec,
+              beat: lineStartBeat + measure.offset + ev.beatStart,
+            });
+            if (
+              Number.isFinite(ev?.timeEndSec) &&
+              Number.isFinite(ev?.beatLength)
+            ) {
+              allTimingPoints.push({
+                timeSec: ev.timeEndSec,
+                beat:
+                  lineStartBeat +
+                  measure.offset +
+                  ev.beatStart +
+                  Math.max(0, ev.beatLength),
+              });
+            }
+          }
+        }
+      }
+    }
+    const firstBeatForMap = Math.max(0, firstEventTime / secPerBeat);
+    const lastBeatForMap = Math.max(
+      firstBeatForMap,
+      lastEventTime / secPerBeat,
+    );
+    allTimingPoints.push({ timeSec: firstEventTime, beat: firstBeatForMap });
+    allTimingPoints.push({ timeSec: lastEventTime, beat: lastBeatForMap });
+    timingMapRef.current = dedupeAndMonotonizeTimingMap(allTimingPoints);
 
     const hasTreble = trebleLines.some((pair) =>
       pair.some((m) => m?.str && m.str.trim().length > 0),
@@ -637,8 +905,10 @@ export default function StaffNotation({
     const width = containerWidth;
     staffWidthRef.current = width;
 
-    // Increase vertical space between systems / staves (taller when VexFlow stave.space > default)
-    const singleLineHeight = hasBass ? 278 : 196;
+    // Increase vertical space between consecutive grand staffs (rows).
+    // (Do not add extra spacing between treble & bass within the same grand staff.)
+    const baseLineHeight = hasBass ? 278 : 196;
+    const singleLineHeight = baseLineHeight + GRAND_STAFF_SYSTEM_GAP_PX;
     const totalLines = lines;
     const height = singleLineHeight * totalLines;
     lineHeightRef.current = singleLineHeight;
@@ -705,7 +975,11 @@ export default function StaffNotation({
       const lastEventTimeLocal = lastEventTimeRef.current || 0;
       if (!lastEventTimeLocal || !Number.isFinite(lastEventTimeLocal)) return;
       const firstBeatLocal = Math.max(0, firstEventTimeLocal / secPerBeat);
-      const lastBeatLocal = Math.max(firstBeatLocal, lastEventTimeLocal / secPerBeat);
+      const lastBeatLocal = Math.max(
+        firstBeatLocal,
+        lastEventTimeLocal / secPerBeat,
+      );
+      const timingMap = timingMapRef.current || [];
 
       const maxLines =
         lineCountRef.current || Math.ceil(totalBeatsLocal / bpl) || 1;
@@ -750,10 +1024,14 @@ export default function StaffNotation({
         firstBeatLocal,
         Math.min(lastBeatLocal, clampedBeats),
       );
-      const beatSpan = Math.max(1e-6, lastBeatLocal - firstBeatLocal);
-      const progress = (clampedWithinWindow - firstBeatLocal) / beatSpan;
       const time =
-        firstEventTimeLocal + progress * (lastEventTimeLocal - firstEventTimeLocal);
+        timingMap.length >= 2
+          ? mapBeatToTime(
+              timingMap,
+              clampedWithinWindow,
+              clampedWithinWindow * secPerBeat,
+            )
+          : clampedWithinWindow * secPerBeat;
 
       onSeekRef.current(time);
     };
@@ -780,8 +1058,8 @@ export default function StaffNotation({
             height,
             backend: canvasBackend,
           },
-          // Slightly wider spacing between staff lines for readability
-          stave: { space: 11 },
+          // Slightly smaller glyph/staff scale to reduce crowding.
+          stave: { space: STAFF_SPACE_PX },
         });
         const score = factory.EasyScore();
         // Match voice length to our per-measure EasyScore strings (quarter-note beats).
@@ -795,15 +1073,15 @@ export default function StaffNotation({
         const measureGap = 0;
         const systemWidth = width - 20;
         const measureWidth = (systemWidth - measureGap) / 2;
-    systemXRef.current = systemX;
-    measureWidthRef.current = measureWidth;
-    measureGapRef.current = measureGap;
-    beatsPerMeasureRef.current = beatsPerMeasure;
-    // Gutter occupied by clef/key/time at the start of each row.
-    firstMeasureLeftPadRef.current = Math.max(
-      54,
-      Math.min(84, measureWidth * 0.31),
-    );
+        systemXRef.current = systemX;
+        measureWidthRef.current = measureWidth;
+        measureGapRef.current = measureGap;
+        beatsPerMeasureRef.current = beatsPerMeasure;
+        // Gutter occupied by clef/key/time at the start of each row.
+        firstMeasureLeftPadRef.current = Math.max(
+          54,
+          Math.min(84, measureWidth * 0.31),
+        );
 
         let loggedTooManyTicks = false;
 
@@ -849,6 +1127,7 @@ export default function StaffNotation({
                 if (!trebleTickables.length) {
                   throw new Error("Empty treble voice");
                 }
+                forceStemDirection(trebleTickables, "up");
                 beamConsecutiveTickables(score, trebleTickables);
                 applyTiesAndSlurs(
                   factory,
@@ -861,6 +1140,12 @@ export default function StaffNotation({
                 const trebleStave = system.addStave({
                   voices: [trebleVoice],
                 });
+                forceMeasureBarlines(
+                  vf,
+                  trebleStave,
+                  measureIndex,
+                  measureIndex === 1,
+                );
                 // Show clef/time only at the start of each row.
                 if (measureIndex === 0) {
                   trebleStave
@@ -891,6 +1176,7 @@ export default function StaffNotation({
                 if (!bassTickables.length) {
                   throw new Error("Empty bass voice");
                 }
+                forceStemDirection(bassTickables, "down");
                 beamConsecutiveTickables(score, bassTickables);
                 applyTiesAndSlurs(
                   factory,
@@ -903,6 +1189,12 @@ export default function StaffNotation({
                 const bassStave = system.addStave({
                   voices: [bassVoice],
                 });
+                forceMeasureBarlines(
+                  vf,
+                  bassStave,
+                  measureIndex,
+                  measureIndex === 1,
+                );
                 // Show clef/time only at the start of each row.
                 if (measureIndex === 0) {
                   bassStave

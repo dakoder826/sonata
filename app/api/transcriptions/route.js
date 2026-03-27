@@ -130,6 +130,7 @@ export async function POST(request) {
       id: transcriptionId || "external-" + Date.now().toString(),
       songUrl,
       midiUrl: serviceData.midi_url,
+      rawMidiUrl: serviceData.raw_midi_url ?? null,
       pdfUrl: serviceData.pdf_url ?? null,
       timeSignature: serviceData.time_signature ?? "4/4",
     };
