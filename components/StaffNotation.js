@@ -1301,7 +1301,10 @@ export default function StaffNotation({
   const headerKey = normalizedKeySignature;
 
   return (
-    <div className="w-full rounded-xl border border-zinc-200 bg-white">
+    <div
+      data-staff-notation="true"
+      className="w-full rounded-xl border border-zinc-200 bg-white"
+    >
       <p className="px-2 pt-2 pb-1 text-[10px] font-medium tracking-wide text-zinc-500 uppercase">
         Staff notation
         <span className="text-zinc-400 normal-case">

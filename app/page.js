@@ -89,7 +89,6 @@ export default function Home() {
       setError("Please paste a song link.");
       return;
     }
-
     setStatus("pending");
     try {
       const response = await fetch("/api/transcriptions", {
@@ -121,7 +120,7 @@ export default function Home() {
 
       <main className="relative z-10 flex-1">
         {/* Hero */}
-        <section className="relative overflow-hidden ">
+        <section className="relative overflow-hidden">
           <div
             className="pointer-events-none absolute inset-0 opacity-[0.035]"
             style={{
@@ -130,8 +129,8 @@ export default function Home() {
             }}
             aria-hidden
           />
-          <div className="relative mx-auto max-w-6xl px-4 pb-10 pt-10 md:px-6 md:pb-16 md:pt-12 lg:pt-14">
-            <p className="text-center text-xs font-medium uppercase tracking-[0.2em] text-neutral-500 md:text-left">
+          <div className="relative mx-auto max-w-6xl px-4 pt-10 pb-10 md:px-6 md:pt-12 md:pb-16 lg:pt-14">
+            <p className="text-center text-xs font-medium tracking-[0.2em] text-neutral-500 uppercase md:text-left">
               AI-Powered Piano Transcription
             </p>
             <div className="mx-auto mt-6 max-w-4xl text-center md:mx-0 md:text-left">
@@ -165,7 +164,7 @@ export default function Home() {
         {/* Converter */}
         <section
           id="convert"
-          className="scroll-mt-24 pb-12 pt-8 md:pb-16 md:pt-10"
+          className="scroll-mt-24 pt-8 pb-12 md:pt-10 md:pb-16"
         >
           <div className="mx-auto max-w-6xl px-4 md:px-6">
             <div className="max-w-2xl">
@@ -180,6 +179,7 @@ export default function Home() {
             <div className="mt-10 max-w-3xl">
               <div className="rounded-2xl border border-neutral-200 bg-neutral-50 p-4 text-neutral-950 shadow-[0_24px_60px_-20px_rgba(0,0,0,0.65)] md:p-7">
                 <SheetCreationForm
+                  showSheetNameField={false}
                   songUrl={songUrl}
                   onSongUrlChange={setSongUrl}
                   cleanLevel={cleanLevel}
@@ -197,6 +197,7 @@ export default function Home() {
                   <div className="mt-6 border-t border-neutral-200 pt-5">
                     <SheetPlaybackPanel
                       title="Your piano sheet"
+                      sheetName={result.sheetName || ""}
                       songUrl={result.songUrl}
                       midiUrl={result.midiUrl}
                       rawMidiUrl={result.rawMidiUrl}

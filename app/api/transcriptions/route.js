@@ -42,13 +42,17 @@ export async function GET() {
 export async function POST(request) {
   try {
     const body = await request.json();
-    const { songUrl, cleanLevel } = body || {};
+    const { sheetName, songUrl, cleanLevel } = body || {};
 
     if (!songUrl || typeof songUrl !== "string") {
       return new Response(JSON.stringify({ error: "songUrl is required" }), {
         status: 400,
       });
     }
+    const normalizedSheetName =
+      typeof sheetName === "string" && sheetName.trim()
+        ? sheetName.trim()
+        : "Untitled sheet";
 
     if (
       cleanLevel != null &&
@@ -76,6 +80,7 @@ export async function POST(request) {
           .from("transcriptions")
           .insert({
             user_id: userId,
+            sheet_name: normalizedSheetName,
             song_url: songUrl,
             clean_level: cleanLevel === "simple" ? "simple" : "regular",
             status: "processing",
@@ -195,6 +200,7 @@ export async function POST(request) {
 
     const result = {
       id: transcriptionId || "external-" + Date.now().toString(),
+      sheetName: normalizedSheetName,
       songUrl,
       midiUrl: serviceData.midi_url,
       rawMidiUrl: serviceData.raw_midi_url ?? null,
@@ -206,6 +212,7 @@ export async function POST(request) {
       const { error: updateError } = await supabase
         .from("transcriptions")
         .update({
+          sheet_name: normalizedSheetName,
           midi_url: result.midiUrl,
           raw_midi_url: result.rawMidiUrl,
           pdf_url: result.pdfUrl,
@@ -225,6 +232,67 @@ export async function POST(request) {
     return new Response(JSON.stringify(result), { status: 200 });
   } catch (error) {
     console.error("POST /api/transcriptions error:", error);
+    return new Response(JSON.stringify({ error: "Something went wrong." }), {
+      status: 500,
+    });
+  }
+}
+
+export async function PATCH(request) {
+  try {
+    const body = await request.json();
+    const { id, sheetName } = body || {};
+
+    if (!id || typeof id !== "string") {
+      return new Response(JSON.stringify({ error: "id is required" }), {
+        status: 400,
+      });
+    }
+    if (!sheetName || typeof sheetName !== "string" || !sheetName.trim()) {
+      return new Response(JSON.stringify({ error: "sheetName is required" }), {
+        status: 400,
+      });
+    }
+
+    const session = await getServerSession(authConfig);
+    const userId = session?.user?.id ?? null;
+    if (!userId) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401,
+      });
+    }
+
+    const supabase = createSupabaseServerClient();
+    const normalizedName = sheetName.trim();
+    const { data, error } = await supabase
+      .from("transcriptions")
+      .update({ sheet_name: normalizedName })
+      .eq("id", id)
+      .eq("user_id", userId)
+      .select("id, sheet_name")
+      .maybeSingle();
+
+    if (error) {
+      console.error("Failed to update sheet name:", error);
+      return new Response(
+        JSON.stringify({ error: "Failed to update sheet name." }),
+        { status: 500 },
+      );
+    }
+    if (!data) {
+      return new Response(JSON.stringify({ error: "Sheet not found." }), {
+        status: 404,
+      });
+    }
+
+    return new Response(
+      JSON.stringify({ id: data.id, sheetName: data.sheet_name }),
+      {
+        status: 200,
+      },
+    );
+  } catch (error) {
+    console.error("PATCH /api/transcriptions error:", error);
     return new Response(JSON.stringify({ error: "Something went wrong." }), {
       status: 500,
     });

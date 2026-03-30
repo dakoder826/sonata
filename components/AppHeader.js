@@ -33,10 +33,10 @@ export default function AppHeader() {
         <div className="flex items-center gap-2 sm:gap-3">
           {!isHome && (
             <Link
-              href="/"
+              href="/sheets"
               className="hidden text-sm font-medium text-neutral-400 transition hover:text-white sm:inline"
             >
-              Home
+              Your Sheets
             </Link>
           )}
           {isHome && (

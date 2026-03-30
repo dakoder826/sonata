@@ -39,8 +39,8 @@ export default async function SheetDetailPage({ params: paramsPromise }) {
     <main className="min-h-screen bg-neutral-950 px-4 py-8 text-neutral-100 md:px-6 md:py-10">
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-6">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <p className="text-xs tracking-[0.2em] text-neutral-500 uppercase">
-            Piano sheet detail
+          <p className="text-lg font-semibold tracking-[0.2em] text-neutral-500 uppercase">
+            {data.sheet_name || "Untitled sheet"}
           </p>
           <Link
             href="/sheets"
@@ -53,6 +53,7 @@ export default async function SheetDetailPage({ params: paramsPromise }) {
         <section className="rounded-2xl border border-neutral-200 bg-neutral-50 p-4 text-neutral-950">
           <SheetPlaybackPanel
             title="Sheet playback"
+            sheetName={data.sheet_name || ""}
             songUrl={data.song_url}
             createdAt={data.created_at}
             midiUrl={data.midi_url}

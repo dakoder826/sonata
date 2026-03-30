@@ -19,6 +19,10 @@ body {
   font-family: var(--font-geist-sans), system-ui, sans-serif;
 }
 
+button:not(:disabled):hover {
+  cursor: pointer;
+}
+
 /* Typewriter headline caret — ~50/50 on/off like a terminal cursor */
 @keyframes typewriter-caret-blink {
   0%,

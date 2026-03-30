@@ -2,6 +2,7 @@ import os
 import tempfile
 import uuid
 import ssl
+import wave
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -98,7 +99,7 @@ MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/media", StaticFiles(directory=str(MEDIA_ROOT)), name="media")
 
 
-def _download_audio_to_temp(audio_url: str) -> Path:
+def _download_audio_to_temp(audio_url: str, max_audio_seconds: float = 300.0) -> Path:
     """
     Download audio from a URL to a temporary file.
     - For YouTube links, use yt-dlp + ffmpeg to get a WAV.
@@ -126,6 +127,31 @@ def _download_audio_to_temp(audio_url: str) -> Path:
 
     # Use yt-dlp for platforms that yt-dlp supports well (YouTube, TikTok, etc.)
     if is_youtube or is_tiktok or is_instagram:
+        # Use yt-dlp metadata to fail early on over-length sources.
+        if max_audio_seconds > 0.0:
+            metadata_opts = {
+                "noplaylist": True,
+                "proxy": "",
+                "quiet": True,
+                "no_warnings": True,
+            }
+            try:
+                with YoutubeDL(metadata_opts) as ydl:
+                    info = ydl.extract_info(audio_url, download=False)
+                duration = info.get("duration") if isinstance(info, dict) else None
+                if isinstance(duration, (int, float)) and duration > max_audio_seconds:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=_duration_limit_error_detail(
+                            float(duration), max_audio_seconds
+                        ),
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                # If metadata probing fails, continue and rely on post-download guard.
+                pass
+
         # Use yt-dlp to extract best audio as WAV
         tmp_dir = tempfile.mkdtemp()
         ydl_opts = {
@@ -219,6 +245,52 @@ def _estimate_bpm(audio_path: Path, max_audio_seconds: float = 120.0) -> float:
         return 120.0
 
 
+def _estimate_audio_duration_seconds(audio_path: Path) -> float | None:
+    """
+    Best-effort source duration probe in seconds.
+    Returns None if duration cannot be determined reliably.
+    """
+    # Prefer header metadata via soundfile when available.
+    if SOUNDFILE_AVAILABLE and sf is not None:
+        try:
+            info = sf.info(str(audio_path))
+            dur = float(getattr(info, "duration", 0.0) or 0.0)
+            if dur > 0.0:
+                return dur
+        except Exception:
+            pass
+
+    # librosa can usually infer duration for many codecs.
+    if LIBROSA_AVAILABLE:
+        try:
+            dur = float(librosa.get_duration(path=str(audio_path)))
+            if dur > 0.0:
+                return dur
+        except Exception:
+            pass
+
+    # Stdlib fallback for WAV files.
+    try:
+        with wave.open(str(audio_path), "rb") as wf:
+            fr = wf.getframerate()
+            if fr and fr > 0:
+                return float(wf.getnframes()) / float(fr)
+    except Exception:
+        pass
+
+    return None
+
+
+def _duration_limit_error_detail(actual_seconds: float, max_seconds: float) -> str:
+    """Build a user-facing duration error in minutes and seconds."""
+    actual_min = actual_seconds / 60.0
+    max_min = max_seconds / 60.0
+    return (
+        f"Audio is too long ({actual_min:.1f} mins). "
+        f"Max allowed is {max_min:.1f} mins"
+    )
+
+
 def _estimate_time_signature(audio_path: Path, max_audio_seconds: float = 90.0) -> tuple[int, int]:
     """
     Guess simple meter from beat onsets (3/4 vs 4/4). Denominator is always 4 here.
@@ -278,8 +350,8 @@ def _arrange_playable_piano(
     """
     if level == "simple":
         # Keep easy mode clearly lighter than balanced in dense buckets,
-        # but allow a small melody-support pair so songs stay recognizable.
-        max_rh, max_lh = 2, 1
+        # but preserve one extra RH note so melody turns are less likely to vanish.
+        max_rh, max_lh = 3, 2
     else:
         max_rh, max_lh = 4, 3
 
@@ -419,7 +491,7 @@ def _extract_vocal_anchor_ids(
     sec_per_beat = 60.0 / tempo
     window = sec_per_beat * (0.42 if level == "simple" else 0.34)
     min_dur = max(0.045, sec_per_beat * 0.08)
-    min_vel = 6
+    min_vel = 10 if level == "simple" else 6
 
     right = sorted(
         [
@@ -463,13 +535,13 @@ def _clean_midi(
     if level == "simple":  # Easy: preserve flow while still removing obvious noise.
         min_duration = 0.055
         min_velocity = 10
-        max_notes_per_chord = 2
+        max_notes_per_chord = 3
         # Keep repeated strikes manageable without erasing phrase identity.
-        min_rearticulation = 0.19
+        min_rearticulation = 0.16
         max_chord_span = 14
-        sustain_merge_gap = 0.19
-        max_left_hand_notes = 1
-        max_right_hand_notes = 2
+        sustain_merge_gap = 0.24
+        max_left_hand_notes = 2
+        max_right_hand_notes = 3
     else:  # balanced — closer to the transcription, still cleaned for playback
         min_duration = 0.055
         min_velocity = 8
@@ -493,7 +565,7 @@ def _clean_midi(
         if level == "simple"
         else min(0.028, max(0.018, seconds_per_beat * 0.048))
     )
-    gap_fill_sec = 0.048 if level == "simple" else 0.026
+    gap_fill_sec = 0.07 if level == "simple" else 0.026
     velocity_alpha = 0.48 if level == "simple" else 0.58
 
     for instrument in pm.instruments:
@@ -523,7 +595,7 @@ def _clean_midi(
         instrument.notes.sort(key=lambda n: (n.start, n.pitch))
 
         # Remove isolated blip notes (much shorter than median, no nearby same-pitch)
-        blip_ratio = 0.34 if level == "simple" else 0.48
+        blip_ratio = 0.32 if level == "simple" else 0.48
         if len(instrument.notes) > 4:
             durations = [n.end - n.start for n in instrument.notes]
             median_dur = float(np.median(durations))
@@ -823,8 +895,8 @@ def _prune_decorative_notes(
     sec_per_beat = 60.0 / tempo
 
     if level == "simple":
-        # More aggressive de-clutter for easy mode.
-        max_dur, max_vel, t_win, p_win = 0.12, 36, 0.17, 3
+        # Easy mode should still keep phrase-defining support notes.
+        max_dur, max_vel, t_win, p_win = 0.08, 24, 0.15, 5
     else:
         max_dur, max_vel, t_win, p_win = 0.10, 32, 0.18, 6
 
@@ -899,8 +971,8 @@ def _bridge_phrase_gaps(notes: list, level: str, bpm: float, split_pitch: int = 
 
     tempo = max(40.0, min(240.0, bpm))
     sec_per_beat = 60.0 / tempo
-    max_bridge_gap = sec_per_beat * (0.95 if level == "simple" else 0.55)
-    release_pad = 0.008 if level == "simple" else 0.012
+    max_bridge_gap = sec_per_beat * (1.2 if level == "simple" else 0.55)
+    release_pad = 0.004 if level == "simple" else 0.012
 
     sorted_notes = sorted(notes, key=lambda n: (n.start, n.pitch, n.end))
 
@@ -945,7 +1017,7 @@ def _limit_local_onset_bursts(
     if level == "simple":
         # Keep anti-flurry behavior, but preserve enough contour to stay recognizable.
         window = sec_per_beat * 0.42
-        max_right, max_left = 2, 1
+        max_right, max_left = 3, 2
     else:
         window = sec_per_beat * 0.3
         max_right, max_left = 3, 3
@@ -1000,6 +1072,13 @@ def _limit_local_onset_bursts(
             ]
             slots = max(0, max_bucket - len(selected))
             selected.extend(remaining[:slots])
+            if level == "simple" and selected:
+                # In easy mode, favor legato continuity over dense re-attacks:
+                # when we drop local flurry notes, let kept notes hold longer.
+                bucket_max_end = max(n.end for n in bucket)
+                hold_cap = window * 1.25
+                for keep in selected:
+                    keep.end = max(keep.end, min(bucket_max_end, keep.start + hold_cap))
             out.extend(selected)
             i = j
 
@@ -1015,6 +1094,71 @@ def _limit_local_onset_bursts(
     right = [n for n in notes_sorted if n.pitch >= split_pitch]
     thinned = thin_hand(left, keep_high_anchor=False) + thin_hand(right, keep_high_anchor=True)
     return sorted(thinned, key=lambda n: (n.start, n.pitch, n.end))
+
+
+def _shape_simple_legato_from_reference(
+    arranged_notes: list,
+    reference_notes: list,
+    bpm: float,
+    split_pitch: int = 60,
+) -> list:
+    """
+    In simple mode, lengthen kept notes using nearby reference-note sustains so
+    we reduce re-attacks while staying closer to the source phrasing.
+    """
+    if not arranged_notes or not reference_notes:
+        return arranged_notes
+
+    tempo = max(40.0, min(240.0, bpm))
+    sec_per_beat = 60.0 / tempo
+    start_tol = sec_per_beat * 0.35
+    pitch_tol = 2
+    release_pad = 0.007
+    max_extra_hold = sec_per_beat * 1.35
+
+    arranged = sorted(arranged_notes, key=lambda n: (n.start, n.pitch, n.end))
+    ref = sorted(reference_notes, key=lambda n: (n.start, n.pitch, n.end))
+
+    def process_hand(hand_notes: list, hand_ref: list) -> None:
+        if not hand_notes:
+            return
+
+        for i, n in enumerate(hand_notes):
+            next_start = hand_notes[i + 1].start if i < len(hand_notes) - 1 else None
+            hold_cap = n.start + max_extra_hold
+            if next_start is not None:
+                hold_cap = min(hold_cap, max(n.start + 0.02, next_start - release_pad))
+
+            best_same = None
+            best_near = None
+            for r in hand_ref:
+                if r.end <= n.end:
+                    continue
+                dt = abs(r.start - n.start)
+                if dt > start_tol:
+                    continue
+
+                if r.pitch == n.pitch:
+                    if best_same is None or r.end > best_same.end:
+                        best_same = r
+                elif abs(r.pitch - n.pitch) <= pitch_tol:
+                    if best_near is None or r.end > best_near.end:
+                        best_near = r
+
+            guide = best_same or best_near
+            if guide is None:
+                continue
+            n.end = max(n.end, min(hold_cap, guide.end))
+            n.end = max(n.end, n.start + 0.02)
+
+    left = [n for n in arranged if n.pitch < split_pitch]
+    right = [n for n in arranged if n.pitch >= split_pitch]
+    ref_left = [n for n in ref if n.pitch < split_pitch]
+    ref_right = [n for n in ref if n.pitch >= split_pitch]
+    process_hand(left, ref_left)
+    process_hand(right, ref_right)
+
+    return sorted(arranged, key=lambda n: (n.start, n.pitch, n.end))
 
 
 def _restore_gap_anchors(
@@ -1495,38 +1639,28 @@ def _run_basic_pitch_multi_pass(
     if inference_mode == "ultra":
         if level != "simple":
             return primary
-        # Simple mode should stay fast, but single-pass ultra can miss phrase
-        # continuity. Add one lightweight recall pass and merge.
+        # Easy mode still needs phrase-defining anchors; keep one conservative
+        # recall pass, but avoid extra passes that hurt latency.
         simple_recall = _run_basic_pitch_pass(
             model,
             audio_path,
-            onset_threshold=clamp01(0.37 + onset_bias),
-            frame_threshold=clamp01(0.215 + frame_bias),
-            minimum_note_length=clamp_len(58.0 * length_scale),
+            onset_threshold=clamp01(0.40 + onset_bias),
+            frame_threshold=clamp01(0.245 + frame_bias),
+            minimum_note_length=clamp_len(70.0 * length_scale),
         )
-        merged = _merge_midis(primary, simple_recall, start_tol=0.03, end_tol=0.055)
-        # Small continuity pass to recover connector notes often missed in sparse
-        # vocal/lead passages, while still much faster than full quality mode.
-        continuity_pass = _run_basic_pitch_pass(
-            model,
-            audio_path,
-            onset_threshold=clamp01(0.35 + onset_bias),
-            frame_threshold=clamp01(0.18 + frame_bias),
-            minimum_note_length=clamp_len(46.0 * length_scale),
-        )
-        return _merge_midis(merged, continuity_pass, start_tol=0.026, end_tol=0.05)
+        return _merge_midis(primary, simple_recall, start_tol=0.024, end_tol=0.045)
 
     sensitive = _run_basic_pitch_pass(
         model,
         audio_path,
         onset_threshold=clamp01(
-            (0.38 if level == "simple" else 0.36) + onset_bias
+            (0.385 if level == "simple" else 0.36) + onset_bias
         ),
         frame_threshold=clamp01(
-            (0.23 if level == "simple" else 0.205) + frame_bias
+            (0.225 if level == "simple" else 0.205) + frame_bias
         ),
         minimum_note_length=clamp_len(
-            (62.0 if level == "simple" else 55.0) * length_scale
+            (60.0 if level == "simple" else 55.0) * length_scale
         ),
     )
     merged = _merge_midis(primary, sensitive, start_tol=0.028, end_tol=0.05)
@@ -1562,13 +1696,6 @@ def _run_basic_pitch(
         chunk_sec, overlap_sec, min_duration_for_chunks = 48.0, 3.2, 32.0
     else:  # ultra — default path: huge windows, minimal overlap = fewest BP runs
         chunk_sec, overlap_sec, min_duration_for_chunks = 72.0, 2.4, 16.0
-
-    if level == "simple" and inference_mode == "ultra":
-        # Keep default fast UX but slightly improve section carry-over at
-        # chunk boundaries (a common source of sparse/dropout regions).
-        chunk_sec = 56.0
-        overlap_sec = 4.2
-        min_duration_for_chunks = 14.0
 
     # Segment + overlap inference gives better section consistency on long songs.
     if LIBROSA_AVAILABLE and SOUNDFILE_AVAILABLE:
@@ -1778,10 +1905,33 @@ def transcribe(req: TranscriptionRequest) -> TranscriptionResponse:
         raise HTTPException(status_code=400, detail="audio_url is required.")
 
     clean_level = _validated_clean_level(req.clean_level)
+    max_audio_seconds = 300.0
+    try:
+        max_audio_seconds = float(
+            os.environ.get("TRANSCRIBER_MAX_AUDIO_SECONDS", "300")
+        )
+    except Exception:
+        max_audio_seconds = 300.0
+    max_audio_seconds = max(0.0, max_audio_seconds)
 
-    input_path = _download_audio_to_temp(req.audio_url)
+    input_path = _download_audio_to_temp(
+        req.audio_url,
+        max_audio_seconds=max_audio_seconds,
+    )
 
     try:
+        # Post-download fallback guard (direct URLs / metadata-miss cases).
+        source_duration = _estimate_audio_duration_seconds(input_path)
+        if (
+            max_audio_seconds > 0.0
+            and source_duration is not None
+            and source_duration > max_audio_seconds
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=_duration_limit_error_detail(source_duration, max_audio_seconds),
+            )
+
         model = _get_basic_pitch_model()
 
         # Fast pipeline (no Demucs, one waveform): default = ultra.
@@ -1916,6 +2066,33 @@ def transcribe(req: TranscriptionRequest) -> TranscriptionResponse:
                     level=clean_level,
                     split_pitch=60,
                 )
+                if clean_level == "simple":
+                    inst.notes = _shape_simple_legato_from_reference(
+                        inst.notes,
+                        ref_notes,
+                        bpm=bpm,
+                        split_pitch=60,
+                    )
+                    # Re-merge and re-bridge after burst-thinning so easy mode
+                    # feels connected (fewer choppy re-attacks).
+                    inst.notes = _consolidate_sustains(
+                        inst.notes,
+                        merge_gap=max(gap2, 0.2),
+                        min_overlap=0.0,
+                    )
+                    inst.notes = _bridge_phrase_gaps(
+                        inst.notes,
+                        level=clean_level,
+                        bpm=bpm,
+                    )
+                    # Final continuity guard after aggressive easy-mode thinning:
+                    # recover only key anchors when long onset holes appear.
+                    inst.notes = _enforce_max_onset_gap(
+                        inst.notes,
+                        ref_notes,
+                        bpm=bpm,
+                        level=clean_level,
+                    )
         cleaned_midi = _scale_velocities(cleaned_midi, clean_level)
         print(
             "[transcribe] arranged piano notes:",

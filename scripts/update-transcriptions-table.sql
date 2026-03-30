@@ -1,4 +1,5 @@
 alter table public.transcriptions
+  add column if not exists sheet_name text,
   add column if not exists midi_url text,
   add column if not exists raw_midi_url text,
   add column if not exists pdf_url text,

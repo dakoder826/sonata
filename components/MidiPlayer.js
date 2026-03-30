@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import * as Tone from "tone";
 import { Midi } from "@tonejs/midi";
 import StaffNotation from "./StaffNotation";
@@ -463,6 +463,8 @@ export default function MidiPlayer({
   url,
   timeSignature: timeSignatureProp,
   notationOnly = false,
+  enablePdfDownload = false,
+  pdfFileName = "piano-sheet.pdf",
 }) {
   const [isLoading, setIsLoading] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -477,6 +479,7 @@ export default function MidiPlayer({
   const [currentTime, setCurrentTime] = useState(0);
   const [playheadTime, setPlayheadTime] = useState(0);
   const [totalDuration, setTotalDuration] = useState(0);
+  const [isDownloadingPdf, setIsDownloadingPdf] = useState(false);
   const startOffsetRef = useRef(0);
   const playTimeoutRef = useRef(null);
   const lastUrlRef = useRef(null);
@@ -488,6 +491,111 @@ export default function MidiPlayer({
   const onsetTimesRef = useRef([]);
   const noteStartRef = useRef(0);
   const noteEndRef = useRef(0);
+  const rootRef = useRef(null);
+
+  const downloadNotationAsPdf = useCallback(async () => {
+    if (isDownloadingPdf) return;
+    setError("");
+    setIsDownloadingPdf(true);
+
+    try {
+      const root = rootRef.current;
+      const notationRoot = root?.querySelector('[data-staff-notation="true"]');
+      const canvas = notationRoot?.querySelector("canvas");
+
+      if (!canvas) {
+        throw new Error("Staff notation is still loading. Please try again.");
+      }
+
+      const { jsPDF } = await import("jspdf");
+      const canvasWidthPx = canvas.width || canvas.clientWidth;
+      const canvasHeightPx = canvas.height || canvas.clientHeight;
+      if (!canvasWidthPx || !canvasHeightPx) {
+        throw new Error("Could not read notation dimensions for PDF export.");
+      }
+
+      const pdf = new jsPDF({
+        orientation: "portrait",
+        unit: "mm",
+        format: "a4",
+        compress: true,
+      });
+      const pageWidthMm = pdf.internal.pageSize.getWidth();
+      const pageHeightMm = pdf.internal.pageSize.getHeight();
+      const marginMm = 10;
+      const drawWidthMm = Math.max(20, pageWidthMm - marginMm * 2);
+      const drawHeightMm = Math.max(20, pageHeightMm - marginMm * 2);
+
+      const sliceHeightPx = Math.max(
+        1,
+        Math.floor((drawHeightMm * canvasWidthPx) / drawWidthMm),
+      );
+
+      let sourceY = 0;
+      let pageIndex = 0;
+      while (sourceY < canvasHeightPx) {
+        const currentSliceHeightPx = Math.min(
+          sliceHeightPx,
+          canvasHeightPx - sourceY,
+        );
+        const pageCanvas = document.createElement("canvas");
+        pageCanvas.width = canvasWidthPx;
+        pageCanvas.height = currentSliceHeightPx;
+        const ctx = pageCanvas.getContext("2d");
+        if (!ctx) {
+          throw new Error("Failed to prepare PDF page image.");
+        }
+
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, pageCanvas.width, pageCanvas.height);
+        ctx.drawImage(
+          canvas,
+          0,
+          sourceY,
+          canvasWidthPx,
+          currentSliceHeightPx,
+          0,
+          0,
+          canvasWidthPx,
+          currentSliceHeightPx,
+        );
+
+        const imageData = pageCanvas.toDataURL("image/png", 1.0);
+        const renderedHeightMm =
+          (currentSliceHeightPx * drawWidthMm) / canvasWidthPx;
+        if (pageIndex > 0) {
+          pdf.addPage("a4", "portrait");
+        }
+        pdf.addImage(
+          imageData,
+          "PNG",
+          marginMm,
+          marginMm,
+          drawWidthMm,
+          renderedHeightMm,
+          undefined,
+          "FAST",
+        );
+
+        sourceY += currentSliceHeightPx;
+        pageIndex += 1;
+      }
+      const safeName = String(pdfFileName || "piano-sheet")
+        .replace(/[<>:"/\\|?*\x00-\x1F]/g, "")
+        .trim()
+        .replace(/\s+/g, "-")
+        .toLowerCase();
+      const fileNameWithExt = safeName.endsWith(".pdf")
+        ? safeName
+        : `${safeName || "piano-sheet"}.pdf`;
+      pdf.save(fileNameWithExt);
+    } catch (err) {
+      console.error("Failed to export staff notation PDF:", err);
+      setError(err.message || "Failed to export PDF.");
+    } finally {
+      setIsDownloadingPdf(false);
+    }
+  }, [isDownloadingPdf, pdfFileName]);
 
   // Parse the MIDI as soon as we have a URL so that
   // - we can render the staff *before* playback
@@ -689,6 +797,7 @@ export default function MidiPlayer({
 
       // Stop any existing playback before starting a new one.
       stopPlaybackEngine();
+      const transport = Tone.getTransport();
 
       // Ensure audio context is running (required after user gesture in many browsers)
       const ctx = Tone.getContext();
@@ -839,7 +948,7 @@ export default function MidiPlayer({
     return () => {
       stopPlaybackEngine();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    /// eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function handlePlayClick() {
@@ -852,9 +961,13 @@ export default function MidiPlayer({
     const sec = (s % 60).toFixed(1);
     return m > 0 ? `${m}:${sec.padStart(4, "0")}` : `${sec}s`;
   };
+  const progressPercent =
+    totalDuration > 0
+      ? Math.max(0, Math.min(100, (currentTime / totalDuration) * 100))
+      : 0;
 
   return (
-    <div className="flex flex-col gap-2">
+    <div ref={rootRef} className="flex flex-col gap-2">
       {!notationOnly && (
         <div className="flex items-center gap-2">
           <button
@@ -879,6 +992,16 @@ export default function MidiPlayer({
           >
             Pause
           </button>
+          {enablePdfDownload && notes.length > 0 && (
+            <button
+              type="button"
+              onClick={downloadNotationAsPdf}
+              disabled={isDownloadingPdf}
+              className="inline-flex items-center justify-center rounded-full border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-800 hover:cursor-pointer hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isDownloadingPdf ? "Preparing PDF..." : "Download PDF"}
+            </button>
+          )}
           {totalDuration > 0 && (
             <span className="text-xs text-zinc-500">
               {formatTime(currentTime)} / {formatTime(totalDuration)}
@@ -906,7 +1029,11 @@ export default function MidiPlayer({
                       playFrom(time);
                     }
                   }}
-                  className="w-full"
+                  className="h-2.5 w-full cursor-pointer appearance-none rounded-full outline-none [&::-moz-range-progress]:h-2.5 [&::-moz-range-progress]:rounded-full [&::-moz-range-progress]:bg-red-500 [&::-moz-range-thumb]:h-4 [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:bg-red-500 [&::-moz-range-thumb]:shadow-[0_0_0_2px_rgba(255,255,255,0.9),0_0_8px_rgba(239,68,68,0.5)] [&::-moz-range-track]:h-2.5 [&::-moz-range-track]:rounded-full [&::-moz-range-track]:bg-zinc-200 [&::-webkit-slider-runnable-track]:h-2.5 [&::-webkit-slider-runnable-track]:rounded-full [&::-webkit-slider-runnable-track]:bg-transparent [&::-webkit-slider-thumb]:mt-[-3px] [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-0 [&::-webkit-slider-thumb]:bg-red-500 [&::-webkit-slider-thumb]:shadow-[0_0_0_2px_rgba(255,255,255,0.9),0_0_8px_rgba(239,68,68,0.5)]"
+                  style={{
+                    accentColor: "#ef4444",
+                    background: `linear-gradient(to right, #ef4444 0%, #ef4444 ${progressPercent}%, #e4e4e7 ${progressPercent}%, #e4e4e7 100%)`,
+                  }}
                 />
               )}
             </div>
