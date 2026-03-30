@@ -1,4 +1,5 @@
 import os
+import base64
 import tempfile
 import uuid
 import ssl
@@ -55,6 +56,35 @@ def _get_basic_pitch_model() -> Model:
 def _env_truthy(name: str) -> bool:
     v = os.environ.get(name, "")
     return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _yt_dlp_cookiefile_from_env() -> Path | None:
+    """
+    Optional yt-dlp cookiefile support for cloud environments.
+    Accepts either:
+    - YTDLP_COOKIES_TEXT: raw Netscape cookie text
+    - YTDLP_COOKIES_B64: base64-encoded Netscape cookie text
+    Returns a temporary cookie file path, or None if not configured.
+    """
+    cookies_text = (os.environ.get("YTDLP_COOKIES_TEXT") or "").strip()
+    cookies_b64 = (os.environ.get("YTDLP_COOKIES_B64") or "").strip()
+
+    if not cookies_text and not cookies_b64:
+        return None
+
+    if not cookies_text and cookies_b64:
+        try:
+            cookies_text = base64.b64decode(cookies_b64).decode("utf-8")
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="YTDLP_COOKIES_B64 is invalid base64/utf-8 content.",
+            ) from exc
+
+    fd, tmp_path = tempfile.mkstemp(prefix="ytcookies-", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(cookies_text)
+    return Path(tmp_path)
 
 
 def _validated_clean_level(level: str) -> str:
@@ -224,6 +254,14 @@ def _download_audio_to_temp(audio_url: str, max_audio_seconds: float = 300.0) ->
 
     # Use yt-dlp for platforms that yt-dlp supports well (YouTube, TikTok, etc.)
     if is_youtube or is_tiktok or is_instagram:
+        cookiefile: Path | None = None
+        try:
+            cookiefile = _yt_dlp_cookiefile_from_env()
+        except HTTPException:
+            raise
+        except Exception:
+            cookiefile = None
+
         # Use yt-dlp metadata to fail early on over-length sources.
         if max_audio_seconds > 0.0:
             metadata_opts = {
@@ -232,6 +270,8 @@ def _download_audio_to_temp(audio_url: str, max_audio_seconds: float = 300.0) ->
                 "quiet": True,
                 "no_warnings": True,
             }
+            if cookiefile is not None:
+                metadata_opts["cookiefile"] = str(cookiefile)
             try:
                 with YoutubeDL(metadata_opts) as ydl:
                     info = ydl.extract_info(audio_url, download=False)
@@ -268,6 +308,8 @@ def _download_audio_to_temp(audio_url: str, max_audio_seconds: float = 300.0) ->
             "quiet": True,
             "no_warnings": True,
         }
+        if cookiefile is not None:
+            ydl_opts["cookiefile"] = str(cookiefile)
 
         try:
             with YoutubeDL(ydl_opts) as ydl:
@@ -276,8 +318,20 @@ def _download_audio_to_temp(audio_url: str, max_audio_seconds: float = 300.0) ->
         except Exception as exc:
             raise HTTPException(
                 status_code=400,
-                detail=f"Failed to download audio from YouTube: {exc}",
+                detail=(
+                    "Failed to download audio from YouTube. "
+                    f"{exc} "
+                    "If YouTube blocks bot checks in production, set "
+                    "YTDLP_COOKIES_B64 (recommended) or YTDLP_COOKIES_TEXT."
+                ),
             ) from exc
+        finally:
+            if cookiefile is not None:
+                try:
+                    if cookiefile.exists():
+                        cookiefile.unlink()
+                except Exception:
+                    pass
 
         base = Path(base_path)
         wav_path = base.with_suffix(".wav")
