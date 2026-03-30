@@ -99,6 +99,16 @@ MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/media", StaticFiles(directory=str(MEDIA_ROOT)), name="media")
 
 
+@app.get("/")
+def root() -> dict[str, str]:
+    return {"status": "ok", "service": "sonata-transcriber"}
+
+
+@app.get("/healthz")
+def healthz() -> dict[str, bool]:
+    return {"ok": True}
+
+
 def _supabase_storage_env() -> tuple[str, str, str] | None:
     """
     Return `(supabase_url, service_role_key, bucket)` when configured.
