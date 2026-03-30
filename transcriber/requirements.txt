@@ -2,9 +2,9 @@ fastapi
 uvicorn
 requests
 certifi
-basic-pitch
-pretty_midi
+basic-pitch==0.4.0
+pretty_midi==0.2.11
 soundfile
 yt-dlp
-librosa
-numpy
+librosa==0.10.2.post1
+numpy==1.26.4
