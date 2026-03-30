@@ -289,10 +289,11 @@ def _download_audio_to_temp(audio_url: str, max_audio_seconds: float = 300.0) ->
                 # If metadata probing fails, continue and rely on post-download guard.
                 pass
 
-        # Use yt-dlp to extract best audio as WAV
+        # Use yt-dlp to extract audio as WAV.
+        # Some YouTube videos do not expose `bestaudio` for every client profile,
+        # so we retry with progressively broader format selectors.
         tmp_dir = tempfile.mkdtemp()
-        ydl_opts = {
-            "format": "bestaudio/best",
+        ydl_opts_base = {
             "outtmpl": os.path.join(tmp_dir, "%(id)s.%(ext)s"),
             "noplaylist": True,
             # Ignore shell/system proxy envs. In local dev this often points to
@@ -309,22 +310,48 @@ def _download_audio_to_temp(audio_url: str, max_audio_seconds: float = 300.0) ->
             "no_warnings": True,
         }
         if cookiefile is not None:
-            ydl_opts["cookiefile"] = str(cookiefile)
+            ydl_opts_base["cookiefile"] = str(cookiefile)
 
-        try:
-            with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(audio_url, download=True)
-                base_path = ydl.prepare_filename(info)
-        except Exception as exc:
+        format_candidates = [
+            "bestaudio/best",
+            "bestaudio",
+            "best",
+        ]
+        last_exc: Exception | None = None
+        base_path: str | None = None
+        for fmt in format_candidates:
+            try:
+                ydl_opts = dict(ydl_opts_base)
+                ydl_opts["format"] = fmt
+                with YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(audio_url, download=True)
+                    base_path = ydl.prepare_filename(info)
+                if base_path:
+                    break
+            except Exception as exc:
+                last_exc = exc
+                # If format is unavailable, try next fallback selector.
+                if "Requested format is not available" in str(exc):
+                    continue
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Failed to download audio from YouTube. "
+                        f"{exc} "
+                        "If YouTube blocks bot checks in production, set "
+                        "YTDLP_COOKIES_B64 (recommended) or YTDLP_COOKIES_TEXT."
+                    ),
+                ) from exc
+        if not base_path:
+            reason = str(last_exc) if last_exc else "No downloadable format found."
             raise HTTPException(
                 status_code=400,
                 detail=(
                     "Failed to download audio from YouTube. "
-                    f"{exc} "
-                    "If YouTube blocks bot checks in production, set "
-                    "YTDLP_COOKIES_B64 (recommended) or YTDLP_COOKIES_TEXT."
+                    f"{reason} "
+                    "Try another link, or set YTDLP_COOKIES_B64 / YTDLP_COOKIES_TEXT."
                 ),
-            ) from exc
+            )
         finally:
             if cookiefile is not None:
                 try:
