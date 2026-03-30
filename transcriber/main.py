@@ -99,6 +99,93 @@ MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/media", StaticFiles(directory=str(MEDIA_ROOT)), name="media")
 
 
+def _supabase_storage_env() -> tuple[str, str, str] | None:
+    """
+    Return `(supabase_url, service_role_key, bucket)` when configured.
+    Returns None when Supabase Storage is fully disabled.
+    Raises HTTPException when partially configured.
+    """
+    supabase_url = (
+        os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+        or os.environ.get("SUPABASE_URL")
+        or ""
+    ).strip().rstrip("/")
+    service_role_key = (
+        os.environ.get("SUPABASE_SECRET_KEY")
+        or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or ""
+    ).strip()
+    bucket = (os.environ.get("SUPABASE_STORAGE_BUCKET") or "").strip()
+
+    any_set = bool(supabase_url or service_role_key or bucket)
+    all_set = bool(supabase_url and service_role_key and bucket)
+
+    if not any_set:
+        return None
+    if not all_set:
+        missing: list[str] = []
+        if not supabase_url:
+            missing.append("NEXT_PUBLIC_SUPABASE_URL (or SUPABASE_URL)")
+        if not service_role_key:
+            missing.append("SUPABASE_SECRET_KEY (or SUPABASE_SERVICE_ROLE_KEY)")
+        if not bucket:
+            missing.append("SUPABASE_STORAGE_BUCKET")
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Supabase Storage is partially configured. Missing env(s): "
+                + ", ".join(missing)
+            ),
+        )
+    return (supabase_url, service_role_key, bucket)
+
+
+def _upload_to_supabase_storage(file_path: Path) -> str:
+    """
+    Upload file to Supabase Storage and return its public URL.
+    """
+    cfg = _supabase_storage_env()
+    if cfg is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Supabase Storage upload requested but storage is not configured.",
+        )
+
+    supabase_url, service_role_key, bucket = cfg
+    prefix = (os.environ.get("SUPABASE_STORAGE_PREFIX") or "midi").strip().strip("/")
+    object_path = f"{prefix}/{file_path.name}" if prefix else file_path.name
+    upload_url = f"{supabase_url}/storage/v1/object/{bucket}/{object_path}"
+
+    headers = {
+        "Authorization": f"Bearer {service_role_key}",
+        "apikey": service_role_key,
+        "x-upsert": "true",
+        "Content-Type": "application/octet-stream",
+    }
+
+    with file_path.open("rb") as f:
+        response = requests.post(
+            upload_url,
+            headers=headers,
+            data=f,
+            timeout=90,
+        )
+
+    if response.status_code not in (200, 201):
+        body = (response.text or "").strip()
+        if len(body) > 240:
+            body = body[:240] + "..."
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Failed to upload MIDI to Supabase Storage "
+                f"(status {response.status_code}). {body}"
+            ),
+        )
+
+    return f"{supabase_url}/storage/v1/object/public/{bucket}/{object_path}"
+
+
 def _download_audio_to_temp(audio_url: str, max_audio_seconds: float = 300.0) -> Path:
     """
     Download audio from a URL to a temporary file.
@@ -2127,12 +2214,18 @@ def transcribe(req: TranscriptionRequest) -> TranscriptionResponse:
         raw_midi_path = MEDIA_ROOT / f"{midi_id}-raw.mid"
         raw_midi.write(str(raw_midi_path))
 
-        base_url = os.environ.get("TRANSCRIBER_PUBLIC_BASE_URL")
-        if not base_url:
-            base_url = "http://localhost:8000"
-
-        midi_url = f"{base_url.rstrip('/')}/media/{midi_path.name}"
-        raw_midi_url = f"{base_url.rstrip('/')}/media/{raw_midi_path.name}"
+        # Production path: upload generated files to Supabase Storage.
+        # Dev fallback: keep serving from local `/media`.
+        storage_cfg = _supabase_storage_env()
+        if storage_cfg is not None:
+            midi_url = _upload_to_supabase_storage(midi_path)
+            raw_midi_url = _upload_to_supabase_storage(raw_midi_path)
+        else:
+            base_url = os.environ.get("TRANSCRIBER_PUBLIC_BASE_URL")
+            if not base_url:
+                base_url = "http://localhost:8000"
+            midi_url = f"{base_url.rstrip('/')}/media/{midi_path.name}"
+            raw_midi_url = f"{base_url.rstrip('/')}/media/{raw_midi_path.name}"
 
         return TranscriptionResponse(
             midi_url=midi_url,
