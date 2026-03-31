@@ -226,6 +226,52 @@ def _upload_to_supabase_storage(file_path: Path) -> str:
     return f"{supabase_url}/storage/v1/object/public/{bucket}/{object_path}"
 
 
+def _pick_best_yt_format_id(info: object) -> str | None:
+    """
+    Select a concrete yt-dlp format_id from metadata.
+    Prefer audio-only streams, otherwise fall back to any stream that has audio.
+    """
+    if not isinstance(info, dict):
+        return None
+    formats = info.get("formats")
+    if not isinstance(formats, list):
+        return None
+
+    best_audio_only: tuple[tuple[float, float, float], str] | None = None
+    best_with_audio: tuple[tuple[float, float], str] | None = None
+
+    for fmt in formats:
+        if not isinstance(fmt, dict):
+            continue
+        format_id = str(fmt.get("format_id") or "").strip()
+        if not format_id:
+            continue
+
+        acodec = str(fmt.get("acodec") or "none").lower()
+        vcodec = str(fmt.get("vcodec") or "none").lower()
+        if acodec == "none":
+            continue
+
+        abr = float(fmt.get("abr") or 0.0)
+        tbr = float(fmt.get("tbr") or 0.0)
+        asr = float(fmt.get("asr") or 0.0)
+
+        if vcodec == "none":
+            score = (abr, tbr, asr)
+            if best_audio_only is None or score > best_audio_only[0]:
+                best_audio_only = (score, format_id)
+        else:
+            score = (abr, tbr)
+            if best_with_audio is None or score > best_with_audio[0]:
+                best_with_audio = (score, format_id)
+
+    if best_audio_only is not None:
+        return best_audio_only[1]
+    if best_with_audio is not None:
+        return best_with_audio[1]
+    return None
+
+
 def _download_audio_to_temp(audio_url: str, max_audio_seconds: float = 300.0) -> Path:
     """
     Download audio from a URL to a temporary file.
@@ -324,7 +370,8 @@ def _download_audio_to_temp(audio_url: str, max_audio_seconds: float = 300.0) ->
 
         try:
             format_candidates = [
-                "bestaudio[ext=m4a]/bestaudio/best",
+                "bestaudio[ext=m4a]/bestaudio*/bestaudio/best",
+                "bestaudio*/best",
                 "best",
                 None,
             ]
@@ -356,6 +403,29 @@ def _download_audio_to_temp(audio_url: str, max_audio_seconds: float = 300.0) ->
                             "YTDLP_COOKIES_B64 (recommended) or YTDLP_COOKIES_TEXT."
                         ),
                     ) from exc
+            if not base_path and is_youtube:
+                try:
+                    probe_opts = {
+                        "noplaylist": True,
+                        "proxy": "",
+                        "quiet": True,
+                        "no_warnings": True,
+                    }
+                    if cookiefile is not None:
+                        probe_opts["cookiefile"] = str(cookiefile)
+                    with YoutubeDL(probe_opts) as ydl:
+                        info = ydl.extract_info(audio_url, download=False)
+                    fallback_format_id = _pick_best_yt_format_id(info)
+                    if fallback_format_id:
+                        ydl_opts = dict(ydl_opts_base)
+                        ydl_opts["format"] = fallback_format_id
+                        # Use yt-dlp default extractor behavior for explicit fallback id.
+                        ydl_opts.pop("extractor_args", None)
+                        with YoutubeDL(ydl_opts) as ydl:
+                            info = ydl.extract_info(audio_url, download=True)
+                            base_path = ydl.prepare_filename(info)
+                except Exception as exc:
+                    last_exc = exc
             if not base_path:
                 reason = str(last_exc) if last_exc else "No downloadable format found."
                 raise HTTPException(
