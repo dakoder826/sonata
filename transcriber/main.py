@@ -87,6 +87,18 @@ def _yt_dlp_cookiefile_from_env() -> Path | None:
     return Path(tmp_path)
 
 
+def _yt_extractor_args_if_enabled() -> dict[str, dict[str, list[str]]] | None:
+    """
+    Optional YouTube client rotation.
+    Keep disabled by default because forcing clients can cause
+    'Requested format is not available' on some videos.
+    Enable with YTDLP_FORCE_PLAYER_CLIENTS=1 if needed.
+    """
+    if not _env_truthy("YTDLP_FORCE_PLAYER_CLIENTS"):
+        return None
+    return {"youtube": {"player_client": ["android", "web", "ios"]}}
+
+
 def _validated_clean_level(level: str) -> str:
     """`clean_level` must be exactly `simple` or `balanced` (case-insensitive trim)."""
     key = str(level).strip().lower()
@@ -317,11 +329,9 @@ def _download_audio_to_temp(audio_url: str, max_audio_seconds: float = 300.0) ->
                 "no_warnings": True,
             }
             if is_youtube:
-                # Rotate client profiles to improve availability for links that
-                # expose different formats per client.
-                metadata_opts["extractor_args"] = {
-                    "youtube": {"player_client": ["android", "web", "ios"]}
-                }
+                maybe_extractor_args = _yt_extractor_args_if_enabled()
+                if maybe_extractor_args is not None:
+                    metadata_opts["extractor_args"] = maybe_extractor_args
             if cookiefile is not None:
                 metadata_opts["cookiefile"] = str(cookiefile)
             try:
@@ -362,9 +372,9 @@ def _download_audio_to_temp(audio_url: str, max_audio_seconds: float = 300.0) ->
             "no_warnings": True,
         }
         if is_youtube:
-            ydl_opts_base["extractor_args"] = {
-                "youtube": {"player_client": ["android", "web", "ios"]}
-            }
+            maybe_extractor_args = _yt_extractor_args_if_enabled()
+            if maybe_extractor_args is not None:
+                ydl_opts_base["extractor_args"] = maybe_extractor_args
         if cookiefile is not None:
             ydl_opts_base["cookiefile"] = str(cookiefile)
 
