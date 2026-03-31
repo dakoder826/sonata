@@ -18,6 +18,6 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # Copy app code last so code-only changes don't invalidate dependency layer.
 COPY main.py /app/main.py
 
-EXPOSE 8000
+EXPOSE 8080
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-c", "import os, uvicorn; uvicorn.run('main:app', host='0.0.0.0', port=int(os.environ.get('PORT', '8080')))"]
