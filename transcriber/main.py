@@ -270,6 +270,12 @@ def _download_audio_to_temp(audio_url: str, max_audio_seconds: float = 300.0) ->
                 "quiet": True,
                 "no_warnings": True,
             }
+            if is_youtube:
+                # Rotate client profiles to improve availability for links that
+                # expose different formats per client.
+                metadata_opts["extractor_args"] = {
+                    "youtube": {"player_client": ["android", "web", "ios"]}
+                }
             if cookiefile is not None:
                 metadata_opts["cookiefile"] = str(cookiefile)
             try:
@@ -309,20 +315,27 @@ def _download_audio_to_temp(audio_url: str, max_audio_seconds: float = 300.0) ->
             "quiet": True,
             "no_warnings": True,
         }
+        if is_youtube:
+            ydl_opts_base["extractor_args"] = {
+                "youtube": {"player_client": ["android", "web", "ios"]}
+            }
         if cookiefile is not None:
             ydl_opts_base["cookiefile"] = str(cookiefile)
 
         format_candidates = [
-            "bestaudio/best",
-            "bestaudio",
+            "bestaudio[ext=m4a]/bestaudio/best",
             "best",
+            None,
         ]
         last_exc: Exception | None = None
         base_path: str | None = None
         for fmt in format_candidates:
             try:
                 ydl_opts = dict(ydl_opts_base)
-                ydl_opts["format"] = fmt
+                if fmt:
+                    ydl_opts["format"] = fmt
+                else:
+                    ydl_opts.pop("format", None)
                 with YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(audio_url, download=True)
                     base_path = ydl.prepare_filename(info)
