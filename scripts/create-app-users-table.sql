@@ -7,8 +7,13 @@ create table if not exists public.users (
   image text,
   password_hash text,
   auth_provider text not null default 'google',
+  plan_tier text not null default 'free',
+  last_seen timestamptz,
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  constraint users_plan_tier_check check (
+    plan_tier in ('free', 'past_due', 'trialing', 'trialing-cancelled', 'pro', 'pro-cancelled')
+  )
 );
 
 create index if not exists users_email_idx on public.users (email);

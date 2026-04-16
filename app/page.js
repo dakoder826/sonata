@@ -1,11 +1,14 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Image from "next/image";
+import { useRouter } from "next/navigation";
+import { useSession } from "next-auth/react";
 import SheetCreationForm from "@/components/SheetCreationForm";
 import SheetPlaybackPanel from "@/components/SheetPlaybackPanel";
 import TypewriterHeadline from "@/components/TypewriterHeadline";
 import FloatingNotes from "@/components/FloatingNotes";
+import PricingPlans from "@/components/PricingPlans";
 
 const FEATURES = [
   {
@@ -74,11 +77,23 @@ function PianoKeyStrip({ className = "" }) {
 }
 
 export default function Home() {
+  const { status: authStatus } = useSession();
+  const router = useRouter();
   const [songUrl, setSongUrl] = useState("");
   const [status, setStatus] = useState("idle"); // idle | pending | done | error
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
   const [cleanLevel, setCleanLevel] = useState("regular"); // simple | regular
+
+  useEffect(() => {
+    if (authStatus === "authenticated") {
+      router.replace("/sheets");
+    }
+  }, [authStatus, router]);
+
+  if (authStatus === "authenticated") {
+    return null;
+  }
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -244,6 +259,8 @@ export default function Home() {
             </ul>
           </div>
         </section>
+
+        <PricingPlans id="pricing" freeCtaHref="#convert" proCtaHref="/sheets" />
 
         {/* How it works — ivory panel */}
         <section className="border-b border-white/10 py-20 md:py-28">

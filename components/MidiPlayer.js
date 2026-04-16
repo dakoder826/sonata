@@ -465,6 +465,7 @@ export default function MidiPlayer({
   notationOnly = false,
   enablePdfDownload = false,
   pdfFileName = "piano-sheet.pdf",
+  extraControls = null,
 }) {
   const [isLoading, setIsLoading] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -992,6 +993,12 @@ export default function MidiPlayer({
           >
             Pause
           </button>
+          {totalDuration > 0 && (
+            <span className="text-xs text-zinc-500">
+              {formatTime(currentTime)} / {formatTime(totalDuration)}
+            </span>
+          )}
+          {extraControls}
           {enablePdfDownload && notes.length > 0 && (
             <button
               type="button"
@@ -1001,11 +1008,6 @@ export default function MidiPlayer({
             >
               {isDownloadingPdf ? "Preparing PDF..." : "Download PDF"}
             </button>
-          )}
-          {totalDuration > 0 && (
-            <span className="text-xs text-zinc-500">
-              {formatTime(currentTime)} / {formatTime(totalDuration)}
-            </span>
           )}
         </div>
       )}

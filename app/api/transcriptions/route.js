@@ -1,6 +1,37 @@
 import { getServerSession } from "next-auth";
 import { authConfig } from "@/auth.config";
 import { createSupabaseServerClient } from "@/lib/supabaseServer";
+import { normalizePlanTier } from "@/lib/billing";
+
+async function getUserPlanTier(supabase, userId) {
+  const { data, error } = await supabase
+    .from("users")
+    .select("plan_tier")
+    .eq("id", userId)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Failed to fetch user plan tier:", error);
+    return "free";
+  }
+
+  return normalizePlanTier(data?.plan_tier);
+}
+
+async function getActiveSheetCount(supabase, userId) {
+  const { count, error } = await supabase
+    .from("transcriptions")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .in("status", ["processing", "completed"]);
+
+  if (error) {
+    console.error("Failed to count active sheets:", error);
+    return 0;
+  }
+
+  return count ?? 0;
+}
 
 export async function GET() {
   try {
@@ -30,7 +61,25 @@ export async function GET() {
       );
     }
 
-    return new Response(JSON.stringify({ items: data ?? [] }), { status: 200 });
+    const planTier = await getUserPlanTier(supabase, userId);
+    const activeSheetCount = (data ?? []).filter((item) =>
+      ["processing", "completed"].includes(item.status || "completed"),
+    ).length;
+    const maxActiveSheets = planTier === "pro" ? null : 1;
+
+    return new Response(
+      JSON.stringify({
+        items: data ?? [],
+        entitlement: {
+          planTier,
+          activeSheetCount,
+          maxActiveSheets,
+          canCreateSheet:
+            planTier === "pro" ? true : activeSheetCount < maxActiveSheets,
+        },
+      }),
+      { status: 200 },
+    );
   } catch (error) {
     console.error("GET /api/transcriptions error:", error);
     return new Response(JSON.stringify({ error: "Something went wrong." }), {
@@ -75,6 +124,21 @@ export async function POST(request) {
     const supabase = userId ? createSupabaseServerClient() : null;
 
     if (userId) {
+      const planTier = await getUserPlanTier(supabase, userId);
+      if (planTier === "free") {
+        const activeSheetCount = await getActiveSheetCount(supabase, userId);
+        if (activeSheetCount >= 1) {
+          return new Response(
+            JSON.stringify({
+              error:
+                "Free plan includes 1 active sheet at a time. Delete your current sheet or upgrade to Pro for unlimited sheets.",
+              code: "limit_reached_free_plan",
+            }),
+            { status: 403 },
+          );
+        }
+      }
+
       try {
         const { data, error } = await supabase
           .from("transcriptions")
@@ -293,6 +357,58 @@ export async function PATCH(request) {
     );
   } catch (error) {
     console.error("PATCH /api/transcriptions error:", error);
+    return new Response(JSON.stringify({ error: "Something went wrong." }), {
+      status: 500,
+    });
+  }
+}
+
+export async function DELETE(request) {
+  try {
+    const body = await request.json();
+    const id = typeof body?.id === "string" ? body.id : "";
+
+    if (!id) {
+      return new Response(JSON.stringify({ error: "id is required" }), {
+        status: 400,
+      });
+    }
+
+    const session = await getServerSession(authConfig);
+    const userId = session?.user?.id ?? null;
+    if (!userId) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401,
+      });
+    }
+
+    const supabase = createSupabaseServerClient();
+    const { data, error } = await supabase
+      .from("transcriptions")
+      .delete()
+      .eq("id", id)
+      .eq("user_id", userId)
+      .select("id")
+      .maybeSingle();
+
+    if (error) {
+      console.error("Failed to delete sheet:", error);
+      return new Response(
+        JSON.stringify({ error: "Failed to delete sheet." }),
+        {
+          status: 500,
+        },
+      );
+    }
+    if (!data) {
+      return new Response(JSON.stringify({ error: "Sheet not found." }), {
+        status: 404,
+      });
+    }
+
+    return new Response(JSON.stringify({ id: data.id }), { status: 200 });
+  } catch (error) {
+    console.error("DELETE /api/transcriptions error:", error);
     return new Response(JSON.stringify({ error: "Something went wrong." }), {
       status: 500,
     });

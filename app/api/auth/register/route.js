@@ -63,6 +63,7 @@ export async function POST(request) {
         name: name || null,
         password_hash: passwordHash,
         auth_provider: "email",
+        plan_tier: "free",
       })
       .select("id, email, name")
       .single();
